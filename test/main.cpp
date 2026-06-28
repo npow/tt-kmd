@@ -27,6 +27,7 @@ void TestMappingsDebugfs(const EnumeratedDevice &dev);
 void TestProcfsPids(const EnumeratedDevice &dev);
 void TestExcl(const EnumeratedDevice &dev);
 void TestSmcMsg(const EnumeratedDevice &dev);
+void TestNocIo(const EnumeratedDevice &dev);
 
 int main(int argc, char *argv[])
 {
@@ -55,6 +56,7 @@ int main(int argc, char *argv[])
         TestIoctlZeroing(d);
         TestTlbs(d);
         TestTlbExport(d);
+        TestNocIo(d);
         TestMappingsDebugfs(d);
         TestProcfsPids(d);
         TestExcl(d);
