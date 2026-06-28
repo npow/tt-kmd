@@ -542,6 +542,87 @@ static long ioctl_set_noc_cleanup(struct chardev_private *priv,
 	return 0;
 }
 
+// Validate the common header of a NOC read/write request. The two request
+// structs share an identical layout, so a single validator covers both.
+static long validate_noc_io(u32 argsz, u32 flags, u16 x, u16 y, const u8 reserved0[2],
+			    u8 noc, u8 width, u64 addr, u32 expected_argsz)
+{
+	if (argsz != expected_argsz)
+		return -EINVAL;
+
+	if (flags != 0 || reserved0[0] != 0 || reserved0[1] != 0)
+		return -EINVAL;
+
+	if (x > 63 || y > 63)
+		return -EINVAL;
+
+	// NOC must be either 0 or 1.
+	if (noc > 1)
+		return -EINVAL;
+
+	// Only 1, 2, 4, and 8 byte transfers are supported.
+	if (width != 1 && width != 2 && width != 4 && width != 8)
+		return -EINVAL;
+
+	// The KMD cannot validate the address itself, but it must be naturally
+	// aligned to the transfer width.
+	if (addr & (width - 1))
+		return -EINVAL;
+
+	return 0;
+}
+
+static long ioctl_noc_read(struct chardev_private *priv, struct tenstorrent_noc_read __user *arg)
+{
+	struct tenstorrent_device *tt_dev = priv->device;
+	struct tenstorrent_noc_read data = {0};
+	u64 value = 0;
+	long ret;
+
+	if (!tt_dev->dev_class->noc_read)
+		return -EOPNOTSUPP;
+
+	if (copy_from_user(&data, arg, sizeof(data)) != 0)
+		return -EFAULT;
+
+	ret = validate_noc_io(data.argsz, data.flags, data.x, data.y, data.reserved0, data.noc,
+			      data.width, data.addr, sizeof(data));
+	if (ret)
+		return ret;
+
+	ret = tt_dev->dev_class->noc_read(tt_dev, data.x, data.y, data.addr, &value, data.width, data.noc);
+	if (ret)
+		return ret;
+
+	data.value = value;
+
+	if (copy_to_user(arg, &data, sizeof(data)) != 0)
+		return -EFAULT;
+
+	return 0;
+}
+
+static long ioctl_noc_write(struct chardev_private *priv, struct tenstorrent_noc_write __user *arg)
+{
+	struct tenstorrent_device *tt_dev = priv->device;
+	struct tenstorrent_noc_write data = {0};
+	long ret;
+
+	if (!tt_dev->dev_class->noc_write)
+		return -EOPNOTSUPP;
+
+	if (copy_from_user(&data, arg, sizeof(data)) != 0)
+		return -EFAULT;
+
+	ret = validate_noc_io(data.argsz, data.flags, data.x, data.y, data.reserved0, data.noc,
+			      data.width, data.addr, sizeof(data));
+	if (ret)
+		return ret;
+
+	// Only the low data.width bytes of data.value are written.
+	return tt_dev->dev_class->noc_write(tt_dev, data.x, data.y, data.addr, &data.value, data.width, data.noc);
+}
+
 static int tenstorrent_set_aggregated_power_state_locked(struct tenstorrent_device *tt_dev)
 {
 	struct tenstorrent_power_state power_state = { 0 };
@@ -848,6 +929,14 @@ static long tt_cdev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
 		case TENSTORRENT_IOCTL_SMC_MSG:
 			ret = ioctl_arc_msg(priv, (struct tenstorrent_smc_msg __user *)arg);
+			break;
+
+		case TENSTORRENT_IOCTL_NOC_READ:
+			ret = ioctl_noc_read(priv, (struct tenstorrent_noc_read __user *)arg);
+			break;
+
+		case TENSTORRENT_IOCTL_NOC_WRITE:
+			ret = ioctl_noc_write(priv, (struct tenstorrent_noc_write __user *)arg);
 			break;
 
 		default:

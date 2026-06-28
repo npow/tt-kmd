@@ -9,6 +9,7 @@
 #include <linux/slab.h>
 #include <linux/jiffies.h>
 #include <linux/delay.h>
+#include <linux/io-64-nonatomic-lo-hi.h>
 
 #include "blackhole.h"
 #include "pcie.h"
@@ -249,17 +250,58 @@ static u8 __iomem *bh_configure_kernel_tlb(struct blackhole_device *bh, u32 x, u
 	return bh->kernel_tlb + offset;
 }
 
-static u32 noc_read32(struct blackhole_device *bh, u32 x, u32 y, u64 addr, int noc)
+static int blackhole_noc_read(struct tenstorrent_device *tt_dev, u32 x, u32 y, u64 addr, void *value, u32 width, int noc)
 {
-	u32 val;
+	struct blackhole_device *bh = tt_dev_to_bh_dev(tt_dev);
 	u8 __iomem *tlb_window;
+	int ret = 0;
 
 	mutex_lock(&bh->kernel_tlb_mutex);
 
 	tlb_window = bh_configure_kernel_tlb(bh, x, y, addr, noc);
-	val = ioread32(tlb_window);
+
+	switch (width) {
+	case 1: *(u8  *)value = ioread8(tlb_window);  break;
+	case 2: *(u16 *)value = ioread16(tlb_window); break;
+	case 4: *(u32 *)value = ioread32(tlb_window); break;
+	case 8: *(u64 *)value = ioread64(tlb_window); break;
+	default: ret = -EINVAL; break;
+	}
 
 	mutex_unlock(&bh->kernel_tlb_mutex);
+
+	return ret;
+}
+
+static int blackhole_noc_write(struct tenstorrent_device *tt_dev, u32 x, u32 y, u64 addr, const void *value, u32 width,
+			       int noc)
+{
+	struct blackhole_device *bh = tt_dev_to_bh_dev(tt_dev);
+	u8 __iomem *tlb_window;
+	int ret = 0;
+
+	mutex_lock(&bh->kernel_tlb_mutex);
+
+	tlb_window = bh_configure_kernel_tlb(bh, x, y, addr, noc);
+
+	switch (width) {
+	case 1: iowrite8(*(const u8  *)value, tlb_window);  break;
+	case 2: iowrite16(*(const u16 *)value, tlb_window); break;
+	case 4: iowrite32(*(const u32 *)value, tlb_window); break;
+	case 8: iowrite64(*(const u64 *)value, tlb_window); break;
+	default: ret = -EINVAL; break;
+	}
+
+	mutex_unlock(&bh->kernel_tlb_mutex);
+
+	return ret;
+}
+
+static u32 noc_read32(struct blackhole_device *bh, u32 x, u32 y, u64 addr, int noc)
+{
+	u32 val = 0;
+
+	blackhole_noc_read(&bh->tt, x, y, addr, &val, sizeof(val), noc);
 
 	return val;
 }
@@ -280,14 +322,7 @@ static void blackhole_report_cable_fault(struct blackhole_device *bh)
 
 static void noc_write32(struct blackhole_device *bh, u32 x, u32 y, u64 addr, u32 data, int noc)
 {
-	u8 __iomem *tlb_window;
-
-	mutex_lock(&bh->kernel_tlb_mutex);
-
-	tlb_window = bh_configure_kernel_tlb(bh, x, y, addr, noc);
-	iowrite32(data, tlb_window);
-
-	mutex_unlock(&bh->kernel_tlb_mutex);
+	blackhole_noc_write(&bh->tt, x, y, addr, &data, sizeof(data), noc);
 }
 
 static int csm_read32(struct blackhole_device *bh, u64 addr, u32 *value)
@@ -919,6 +954,8 @@ struct tenstorrent_device_class blackhole_class = {
 	.configure_outbound_atu = blackhole_configure_outbound_atu,
 	.noc_write32 = blackhole_noc_write32,
 	.interrupt = blackhole_interrupt,
+	.noc_read = blackhole_noc_read,
+	.noc_write = blackhole_noc_write,
 	.csm_read32 = blackhole_csm_read32,
 	.csm_write32 = blackhole_csm_write32,
 	.arc_msg_locate_queue = blackhole_arc_msg_locate_queue,
