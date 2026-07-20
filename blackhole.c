@@ -74,6 +74,8 @@
 #define ARC_MSG_TYPE_TEST 0x90
 #define ARC_BOOT_STATUS RESET_SCRATCH(2)
 #define ARC_BOOT_STATUS_READY_FOR_MSG 0x1
+#define ARC_ERROR_STATUS0 RESET_SCRATCH(4)
+#define ARC_ERROR_STATUS0_CABLE_FAULT BIT(1)
 
 #define IATU_BASE 0x1000	// Relative to the start of BAR2
 #define IATU_OUTBOUND 0
@@ -255,6 +257,20 @@ static u32 noc_read32(struct blackhole_device *bh, u32 x, u32 y, u64 addr, int n
 	mutex_unlock(&bh->kernel_tlb_mutex);
 
 	return val;
+}
+
+static void blackhole_report_cable_fault(struct blackhole_device *bh)
+{
+	u32 error_status0 = noc_read32(bh, ARC_X, ARC_Y, ARC_ERROR_STATUS0, 0);
+
+	if (error_status0 == U32_MAX)
+		return;
+
+	if (error_status0 & ARC_ERROR_STATUS0_CABLE_FAULT)
+		dev_err(&bh->tt.pdev->dev,
+			"Firmware reported a power cable fault (error status 0x%08x); "
+			"shut down the system and check that the 12V-2x6 power cable is fully seated\n",
+			error_status0);
 }
 
 static void noc_write32(struct blackhole_device *bh, u32 x, u32 y, u64 addr, u32 data, int noc)
@@ -629,6 +645,8 @@ static bool blackhole_init_hardware(struct tenstorrent_device *tt_dev)
 	msg.header = ARC_MSG_TYPE_ASIC_STATE0;
 	if (!send_arc_message(bh, &msg))
 		dev_err(&tt_dev->pdev->dev, "Failed to send ARC message for A0 state\n");
+	else
+		blackhole_report_cable_fault(bh);
 
 	memset(&msg, 0, sizeof(msg));
 	msg.header = ARC_MSG_TYPE_SET_WDT_TIMEOUT;
