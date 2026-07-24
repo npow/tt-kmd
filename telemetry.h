@@ -81,6 +81,11 @@ extern const struct hwmon_ops tt_hwmon_ops;
 
 #define ARC_CSM_BASE 0x10000000
 #define ARC_CSM_SIZE (1 << 19)
+
+// A telemetry tag table entry packs the tag ID into 16 bits, so a table with
+// more entries than the tag space cannot be well-formed.
+#define TELEMETRY_MAX_ENTRIES (1 << 16)
+
 static inline bool is_range_within_csm(u64 addr, size_t len)
 {
 	return (addr >= ARC_CSM_BASE) && (addr <= (ARC_CSM_BASE + ARC_CSM_SIZE) - len);
