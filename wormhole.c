@@ -539,7 +539,8 @@ static int wormhole_populate_telemetry_cache(struct tenstorrent_device *tt_dev,
 	base_addr = ioread32(wh->bar4_mapping + ARC_TELEMETRY_PTR);
 	data_addr = ioread32(wh->bar4_mapping + ARC_TELEMETRY_DATA);
 
-	if (!is_range_within_csm(base_addr, sizeof(u32)) || !is_range_within_csm(data_addr, sizeof(u32))) {
+	// The telemetry header is two u32s: a version, then the entry count.
+	if (!is_range_within_csm(base_addr, 2 * sizeof(u32)) || !is_range_within_csm(data_addr, sizeof(u32))) {
 		dev_err(&tt_dev->pdev->dev, "Telemetry not available\n");
 		return -ENODEV;
 	}
@@ -556,6 +557,12 @@ static int wormhole_populate_telemetry_cache(struct tenstorrent_device *tt_dev,
 
 	tags_addr = base_addr + 8;
 	num_entries = ioread32(wh->bar4_mapping + wh_arc_addr_to_sysreg(base_addr + 4));
+
+	if (num_entries > TELEMETRY_MAX_ENTRIES ||
+	    !is_range_within_csm(tags_addr, num_entries * sizeof(u32))) {
+		dev_err(&tt_dev->pdev->dev, "Bad telemetry table: %u entries at 0x%08X\n", num_entries, tags_addr);
+		return -ENODEV;
+	}
 
 	for (i = 0; i < num_entries; i++) {
 		u32 tag_entry = ioread32(wh->bar4_mapping + wh_arc_addr_to_sysreg(tags_addr + (i * 4)));
@@ -634,7 +641,9 @@ static bool is_fw_ready_for_telemetry(struct wormhole_device *wh)
 {
 	u32 base_addr = ioread32(wh->bar4_mapping + ARC_TELEMETRY_PTR);
 	u32 data_addr = ioread32(wh->bar4_mapping + ARC_TELEMETRY_DATA);
-	bool ready = is_range_within_csm(base_addr, 4) && is_range_within_csm(data_addr, 4);
+	// Ready means the header is readable: a version u32 at base_addr and the
+	// entry count in the u32 after it, hence 8 bytes.
+	bool ready = is_range_within_csm(base_addr, 2 * sizeof(u32)) && is_range_within_csm(data_addr, sizeof(u32));
 
 	return ready;
 }
