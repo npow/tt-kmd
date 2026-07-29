@@ -8,6 +8,9 @@ PROG := ttkmd_test
 # Host-only unit test binary (no hardware/kernel module required).
 UNIT_PROG := fwlog_test
 
+# SMC_MSG stress/adversarial test (requires hardware).
+ARC_MSG_PROG := arc_msg_test
+
 TEST_SOURCES := get_driver_info.cpp get_device_info.cpp query_mappings.cpp \
 	dma_buf.cpp pin_pages.cpp config_space.cpp lock.cpp hwmon.cpp map_peer_bar.cpp \
 	ioctl_overrun.cpp ioctl_zeroing.cpp tlbs.cpp dmabuf_export.cpp release.cpp \
@@ -22,6 +25,7 @@ UNIT_OBJS := $(BUILDDIR)/fwlog_test.o $(BUILDDIR)/fwlog_parser.o
 
 OPT_FLAGS := -O2
 CXXFLAGS := -std=c++17 -Wall -Wno-narrowing $(OPT_FLAGS)
+CFLAGS := -Wall -Wextra $(OPT_FLAGS)
 
 # fwlog_test.cpp includes the driver's fwlog.h directly from the parent directory.
 $(BUILDDIR)/fwlog_test.o: CXXFLAGS += -I..
@@ -33,13 +37,16 @@ $(BUILDDIR)/fwlog_parser.o: ../fwlog_parser.c fwlog_compat.h ../fwlog.h | $(BUIL
 	$(CXX) $(CXXFLAGS) -I.. -include fwlog_compat.h -x c++ -c $< -o $@
 
 .PHONY: all
-all:: $(PROG) $(UNIT_PROG)
+all:: $(PROG) $(UNIT_PROG) $(ARC_MSG_PROG)
 
 $(PROG): $(OBJS)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) $(LIBS) $^ -o $@
 
 $(UNIT_PROG): $(UNIT_OBJS)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) $^ -o $@
+
+$(ARC_MSG_PROG): arc_msg_test.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -pthread $< -o $@
 
 $(BUILDDIR)/%.o: %.cpp | $(BUILDDIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
@@ -52,7 +59,15 @@ $(BUILDDIR):
 check: $(UNIT_PROG)
 	./$(UNIT_PROG)
 
+# Build and run everything: host-only unit tests first, then the
+# hardware tests (these need the module loaded and devices present).
+.PHONY: test
+test: all
+	./$(UNIT_PROG)
+	./$(PROG)
+	./$(ARC_MSG_PROG)
+
 .PHONY: clean
 clean::
 	-rm -rf $(BUILDDIR)
-	-rm -f $(PROG) $(UNIT_PROG)
+	-rm -f $(PROG) $(UNIT_PROG) $(ARC_MSG_PROG)
