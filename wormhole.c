@@ -572,6 +572,8 @@ static int wormhole_populate_telemetry_cache(struct tenstorrent_device *tt_dev,
 		struct telem_cache_entry key = { .tag_id = tag_id };
 		struct telem_cache_entry *entry;
 
+		cond_resched();
+
 		if (!is_range_within_csm(addr, sizeof(u32))) {
 			dev_err(&tt_dev->pdev->dev, "Telemetry tag %u has invalid address 0x%08X\n", tag_id, addr);
 			continue;
