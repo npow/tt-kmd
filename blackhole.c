@@ -479,7 +479,8 @@ static int blackhole_populate_telemetry_cache(struct tenstorrent_device *tt_dev,
 	base_addr = noc_read32(bh, ARC_X, ARC_Y, ARC_TELEMETRY_PTR, 0);
 	data_addr = noc_read32(bh, ARC_X, ARC_Y, ARC_TELEMETRY_DATA, 0);
 
-	if (!is_range_within_csm(base_addr, 1) || !is_range_within_csm(data_addr, 1)) {
+	// The telemetry header is two u32s: a version, then an entry count.
+	if (!is_range_within_csm(base_addr, 2 * sizeof(u32)) || !is_range_within_csm(data_addr, sizeof(u32))) {
 		dev_err(&tt_dev->pdev->dev, "Telemetry not available\n");
 		return -ENODEV;
 	}
@@ -497,13 +498,26 @@ static int blackhole_populate_telemetry_cache(struct tenstorrent_device *tt_dev,
 	tags_addr = base_addr + 8;
 	num_entries = noc_read32(bh, ARC_X, ARC_Y, base_addr + 4, 0);
 
+	if (num_entries > TELEMETRY_MAX_ENTRIES ||
+	    !is_range_within_csm(tags_addr, num_entries * sizeof(u32))) {
+		dev_err(&tt_dev->pdev->dev, "Bad telemetry table: %u entries at 0x%08X\n", num_entries, tags_addr);
+		return -ENODEV;
+	}
+
 	for (i = 0; i < num_entries; i++) {
 		u32 tag_entry = noc_read32(bh, ARC_X, ARC_Y, tags_addr + (i * 4), 0);
 		u16 tag_id = tag_entry & 0xFFFF;
 		u16 offset = (tag_entry >> 16) & 0xFFFF;
-		u32 addr = data_addr + (offset * 4);
+		u32 addr = data_addr + (offset * sizeof(u32));
 		struct telem_cache_entry key = { .tag_id = tag_id };
 		struct telem_cache_entry *entry;
+
+		cond_resched();
+
+		if (!is_range_within_csm(addr, sizeof(u32))) {
+			dev_err(&tt_dev->pdev->dev, "Telemetry tag %u has invalid address 0x%08X\n", tag_id, addr);
+			continue;
+		}
 
 		entry = bsearch(&key, cache, count, sizeof(*cache),
 				telem_cache_entry_cmp);
