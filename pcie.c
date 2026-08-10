@@ -58,9 +58,49 @@ bool safe_pci_restore_state(struct pci_dev *pdev) {
 	return true;
 }
 
+// Some root ports lose their own PCI_COMMAND when the devices below them are
+// reset, whether by secondary bus reset or by the link dropping from the far
+// end. With Bus Master Enable clear, the bridge stops forwarding memory writes
+// from its secondary side upstream, so DMA from everything below it is answered
+// with Unsupported Request. Nothing notices: memory writes are posted, so there
+// is no completion to carry the error back.
+//
+// Callers pair pcie_read_bridge_command before a reset with
+// pcie_restore_bridge_command after it, which re-sets whatever the reset
+// cleared. Both are no-ops when there is no upstream bridge, and the restore is
+// a no-op on hardware that preserves the register.
+u16 pcie_read_bridge_command(struct pci_dev *pdev) {
+	struct pci_dev *bridge_dev = pci_upstream_bridge(pdev);
+	u16 command;
+
+	if (!bridge_dev || pci_read_config_word(bridge_dev, PCI_COMMAND, &command) != PCIBIOS_SUCCESSFUL)
+		return 0;
+
+	return command;
+}
+
+void pcie_restore_bridge_command(struct pci_dev *pdev, u16 saved) {
+	struct pci_dev *bridge_dev = pci_upstream_bridge(pdev);
+	u16 command;
+
+	if (!bridge_dev || pci_read_config_word(bridge_dev, PCI_COMMAND, &command) != PCIBIOS_SUCCESSFUL)
+		return;
+
+	if ((command & saved) == saved)
+		return;
+
+	dev_warn_once(&bridge_dev->dev,
+		      "reset of downstream device cleared PCI_COMMAND (0x%04x -> 0x%04x), restoring\n",
+		      saved, command);
+
+	pci_write_config_word(bridge_dev, PCI_COMMAND, command | saved);
+}
+
 bool pcie_hot_reset_and_restore_state(struct pci_dev *pdev) {
 	struct pci_dev *bridge_dev = pci_upstream_bridge(pdev);
+	u16 bridge_command;
 	u16 bridge_ctrl;
+	bool link_up;
 	bool result;
 	bool saved_ignore_hotplug = pdev->ignore_hotplug;
 
@@ -68,6 +108,8 @@ bool pcie_hot_reset_and_restore_state(struct pci_dev *pdev) {
 		return false;
 
 	pci_ignore_hotplug(pdev);
+
+	bridge_command = pcie_read_bridge_command(pdev);
 
 	// reset link - like pci_reset_secondary_bus, but we don't want the full 1s delay.
 	pci_read_config_word(bridge_dev, PCI_BRIDGE_CONTROL, &bridge_ctrl);
@@ -77,7 +119,12 @@ bool pcie_hot_reset_and_restore_state(struct pci_dev *pdev) {
 	pci_write_config_word(bridge_dev, PCI_BRIDGE_CONTROL, bridge_ctrl);
 	msleep(500);
 
-	result = poll_pcie_link_up(pdev, 10000) && safe_pci_restore_state(pdev);
+	// Restore the bridge before the endpoint, so the endpoint comes back to a
+	// working path upstream, and whether or not our device returned, since any
+	// sibling below the bridge needs it too.
+	link_up = poll_pcie_link_up(pdev, 10000);
+	pcie_restore_bridge_command(pdev, bridge_command);
+	result = link_up && safe_pci_restore_state(pdev);
 
 	if (!saved_ignore_hotplug) {
 		// There is no pci_unignore_hotplug(), but the flag is just a struct

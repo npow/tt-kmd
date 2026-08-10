@@ -38,6 +38,7 @@ struct tenstorrent_device {
 	const struct tenstorrent_device_class *dev_class;
 	bool detached; // No longer valid for hardware access
 	bool needs_hw_init;
+	u16 saved_bridge_command; // Upstream bridge PCI_COMMAND, captured before an ASIC reset
 	atomic_long_t reset_gen; // Generation counter, incremented on reset
 	struct rw_semaphore reset_rwsem;
 	struct dentry *debugfs_root;

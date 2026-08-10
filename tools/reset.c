@@ -9,7 +9,10 @@
 //  gcc -o reset reset.c
 //
 // To Run:
-//  ./reset [--dmc] <device_id>
+//  ./reset [--dmc | --sbr] <device_id>
+//
+// --dmc resets the DMC along with the ASIC. --sbr performs only the secondary
+// bus reset that the full sequence would do first, and stops there.
 //
 
 #include <stdio.h>
@@ -40,6 +43,7 @@
 #define TENSTORRENT_IOCTL_RESET_DEVICE _IO(TENSTORRENT_IOCTL_MAGIC, 6)
 
 // Flags for tenstorrent_reset_device_in.flags
+#define TENSTORRENT_RESET_DEVICE_RESET_PCIE_LINK 1
 #define TENSTORRENT_RESET_DEVICE_ASIC_RESET 4
 #define TENSTORRENT_RESET_DEVICE_ASIC_DMC_RESET 5
 #define TENSTORRENT_RESET_DEVICE_POST_RESET 6
@@ -68,6 +72,54 @@ struct tenstorrent_reset_device {
     struct { __u32 output_size_bytes; __u32 flags; } in;
     struct { __u32 output_size_bytes; __u32 result; } out;
 };
+
+/**
+ * @brief Issues a RESET_DEVICE ioctl with the given flags.
+ * @return 0 on success, -errno if the ioctl failed, or the driver's nonzero
+ *         result code if the driver refused the request.
+ */
+int issue_reset(int fd, __u32 flags) {
+    struct tenstorrent_reset_device cmd = {0};
+    cmd.in.flags = flags;
+    cmd.in.output_size_bytes = sizeof(cmd.out);
+
+    if (ioctl(fd, TENSTORRENT_IOCTL_RESET_DEVICE, &cmd) < 0)
+        return -errno;
+
+    return cmd.out.result;
+}
+
+/**
+ * @brief Describes an issue_reset return value. Uses static storage.
+ */
+const char *reset_error_string(int status) {
+    static char buf[64];
+
+    if (status < 0)
+        snprintf(buf, sizeof(buf), "%s", strerror(-status));
+    else
+        snprintf(buf, sizeof(buf), "driver result %d", status);
+
+    return buf;
+}
+
+/**
+ * @brief Issues a secondary bus reset on the given device and nothing else.
+ *
+ * The driver restores config space afterwards and the device stays on the bus,
+ * so there is no reappearance to wait for and no POST_RESET to issue. Fatal on
+ * failure: unlike in the full sequence, this reset is the whole request.
+ */
+void secondary_bus_reset(const char *dev_path) {
+    int fd = open(dev_path, O_RDWR | O_APPEND);
+    if (fd < 0) FATAL("Could not open device %s: %s", dev_path, strerror(errno));
+
+    int status = issue_reset(fd, TENSTORRENT_RESET_DEVICE_RESET_PCIE_LINK);
+    close(fd);
+
+    if (status != 0) FATAL("RESET_PCIE_LINK failed: %s", reset_error_string(status));
+    INFO("Secondary bus reset completed on %s.", dev_path);
+}
 
 /**
  * @brief Retrieves the device type (Wormhole or Blackhole) for a given device ID.
@@ -158,26 +210,36 @@ int find_dev_id_by_bdf(const char *target_bdf) {
 
 
 int main(int argc, char *argv[]) {
-    if (argc < 2 || argc > 3) {
-        fprintf(stderr, "Usage: %s [--dmc] <device_id>\n", argv[0]);
-        exit(1);
+    static const char usage[] = "Usage: %s [--dmc | --sbr] <device_id>\n";
+    int dmc_reset = 0;
+    int sbr_only = 0;
+    int dev_id_arg_index;
+
+    for (dev_id_arg_index = 1; dev_id_arg_index < argc; dev_id_arg_index++) {
+        if (strcmp(argv[dev_id_arg_index], "--dmc") == 0)
+            dmc_reset = 1;
+        else if (strcmp(argv[dev_id_arg_index], "--sbr") == 0)
+            sbr_only = 1;
+        else
+            break;
     }
 
-    int dmc_reset = 0;
-    int dev_id_arg_index = 1;
-    if (argc == 3) {
-        if (strcmp(argv[1], "--dmc") == 0) {
-            dmc_reset = 1;
-            dev_id_arg_index = 2;
-        } else {
-            FATAL("Invalid option: %s. Usage: %s [--dmc] <device_id>", argv[1], argv[0]);
-        }
+    if (dev_id_arg_index != argc - 1) {
+        fprintf(stderr, usage, argv[0]);
+        exit(1);
     }
+    if (dmc_reset && sbr_only) FATAL("--dmc and --sbr are mutually exclusive.");
 
     int initial_dev_id = atoi(argv[dev_id_arg_index]);
     char pci_bdf[BDF_STRING_SIZE];
     char dev_path[PATH_MAX];
     snprintf(dev_path, sizeof(dev_path), "/dev/tenstorrent/%d", initial_dev_id);
+
+    // The bare secondary bus reset needs neither the BDF nor the device type.
+    if (sbr_only) {
+        secondary_bus_reset(dev_path);
+        return 0;
+    }
 
     INFO("Starting reset on device /dev/tenstorrent/%d (%s)...", initial_dev_id, dmc_reset ? "ASIC+DMC" : "ASIC-only");
 
@@ -196,16 +258,23 @@ int main(int argc, char *argv[]) {
     int fd = open(dev_path, O_RDWR | O_APPEND);
     if (fd < 0) FATAL("Could not open device %s: %s", dev_path, strerror(errno));
 
-    struct tenstorrent_reset_device reset_cmd = {0};
-    reset_cmd.in.flags = dmc_reset ? TENSTORRENT_RESET_DEVICE_ASIC_DMC_RESET : TENSTORRENT_RESET_DEVICE_ASIC_RESET;
-    reset_cmd.in.output_size_bytes = sizeof(reset_cmd.out);
-    if (ioctl(fd, TENSTORRENT_IOCTL_RESET_DEVICE, &reset_cmd) < 0) {
+    // Secondary bus reset first, so that the ASIC reset is triggered against a
+    // link and a config space in a known state. The driver restores config
+    // space afterwards. This is best-effort: if it fails, the ASIC reset below
+    // may still work, so report and keep going.
+    int status = issue_reset(fd, TENSTORRENT_RESET_DEVICE_RESET_PCIE_LINK);
+    if (status != 0)
+        fprintf(stderr, "%s: RESET_PCIE_LINK failed: %s; continuing\n",
+                dev_path, reset_error_string(status));
+    else
+        INFO("RESET_PCIE_LINK completed on %s.", dev_path);
+
+    __u32 asic_reset_flag = dmc_reset ? TENSTORRENT_RESET_DEVICE_ASIC_DMC_RESET
+                                      : TENSTORRENT_RESET_DEVICE_ASIC_RESET;
+    status = issue_reset(fd, asic_reset_flag);
+    if (status != 0) {
         close(fd);
-        FATAL("Reset trigger ioctl failed: %s", strerror(errno));
-    }
-    if (reset_cmd.out.result != 0) {
-        close(fd);
-        FATAL("Reset trigger %u returned error code %u", reset_cmd.in.flags, reset_cmd.out.result);
+        FATAL("Reset trigger %u failed: %s", asic_reset_flag, reset_error_string(status));
     }
     close(fd);
 
@@ -275,16 +344,10 @@ int main(int argc, char *argv[]) {
     fd = open(new_dev_path, O_RDWR | O_APPEND);
     if (fd < 0) FATAL("Could not open re-discovered device node %s: %s", new_dev_path, strerror(errno));
 
-    memset(&reset_cmd, 0, sizeof(reset_cmd));
-    reset_cmd.in.flags = TENSTORRENT_RESET_DEVICE_POST_RESET;
-    reset_cmd.in.output_size_bytes = sizeof(reset_cmd.out);
-    if (ioctl(fd, TENSTORRENT_IOCTL_RESET_DEVICE, &reset_cmd) < 0) {
+    status = issue_reset(fd, TENSTORRENT_RESET_DEVICE_POST_RESET);
+    if (status != 0) {
         close(fd);
-        FATAL("POST_RESET ioctl failed: %s", strerror(errno));
-    }
-    if (reset_cmd.out.result != 0) {
-        close(fd);
-        FATAL("POST_RESET ioctl returned error code %u", reset_cmd.out.result);
+        FATAL("POST_RESET failed: %s", reset_error_string(status));
     }
     close(fd);
 

@@ -290,6 +290,7 @@ static long ioctl_reset_device(struct chardev_private *priv,
 		tenstorrent_vma_zap(tt_dev);
 		tenstorrent_reset_reclaim_tlbs(tt_dev);
 		tenstorrent_reset_reclaim_iatus(tt_dev);
+		tt_dev->saved_bridge_command = pcie_read_bridge_command(pdev);
 		ok = set_reset_marker(pdev);
 		priv->device->needs_hw_init = true;
 	} else if (in.flags == TENSTORRENT_RESET_DEVICE_ASIC_RESET) {
@@ -297,6 +298,7 @@ static long ioctl_reset_device(struct chardev_private *priv,
 		tenstorrent_vma_zap(tt_dev);
 		tenstorrent_reset_reclaim_tlbs(tt_dev);
 		tenstorrent_reset_reclaim_iatus(tt_dev);
+		tt_dev->saved_bridge_command = pcie_read_bridge_command(pdev);
 		ok = priv->device->dev_class->reset(priv->device, in.flags);
 		priv->device->needs_hw_init = true;
 	} else if (in.flags == TENSTORRENT_RESET_DEVICE_ASIC_DMC_RESET) {
@@ -304,9 +306,15 @@ static long ioctl_reset_device(struct chardev_private *priv,
 		tenstorrent_vma_zap(tt_dev);
 		tenstorrent_reset_reclaim_tlbs(tt_dev);
 		tenstorrent_reset_reclaim_iatus(tt_dev);
+		tt_dev->saved_bridge_command = pcie_read_bridge_command(pdev);
 		ok = priv->device->dev_class->reset(priv->device, in.flags);
 		priv->device->needs_hw_init = true;
 	} else if (in.flags == TENSTORRENT_RESET_DEVICE_POST_RESET) {
+		// Ahead of the needs_hw_init check below: the bridge needs its command
+		// register back whether the device returned in place or via a fresh
+		// probe, and before anything tries to reach the device through it.
+		pcie_restore_bridge_command(pdev, tt_dev->saved_bridge_command);
+
 		ok = is_reset_marker_zero(pdev);
 
 		// In the hotplug case, needs_hw_init is false and there is nothing to
