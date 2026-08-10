@@ -27,6 +27,7 @@ For other distributions, install from source (see below).
     * `dnf install dkms` (Fedora)
     * `apk install akms` (Alpine)
     * `dnf install epel-release && dnf install dkms` (Enterprise Linux based)
+    * `emerge sys-kernel/dkms` (Gentoo)
 ```
 make dkms
 ```
