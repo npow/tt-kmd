@@ -327,6 +327,8 @@ static int tt_hwmon_read(struct device *dev, enum hwmon_sensor_types type, u32 a
 					raw = (raw >> 16) & 0xFFFF;  // VDD_LIMITS: max in upper 16
 				*val = raw;		// Reported in mV
 			} else if (type == hwmon_fan) {
+				if (raw == 0xFFFFFFFF)
+					return -ENODATA; // Firmware reports fan control disabled
 				*val = raw;		// Reported in RPM
 			}
 			return 0;
