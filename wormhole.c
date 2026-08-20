@@ -10,6 +10,7 @@
 #include <linux/sysfs.h>
 #include <linux/delay.h>
 #include <linux/pci.h>
+#include <linux/io-64-nonatomic-lo-hi.h>
 
 #include "wormhole.h"
 #include "pcie.h"
@@ -926,9 +927,11 @@ static int wormhole_describe_tlb(struct tenstorrent_device *tt_dev, int tlb,
 	return 0;
 }
 
-static u8 __iomem *wh_configure_kernel_tlb(struct wormhole_device *wh, u32 x, u32 y, u64 addr, int noc) {
+static int wh_configure_kernel_tlb(struct wormhole_device *wh, u32 x, u32 y, u64 addr, int noc, u8 __iomem **tlb_window)
+{
 	struct tenstorrent_noc_tlb_config config = { 0 };
 	u64 offset = addr & TLB_16M_WINDOW_MASK;
+	int ret;
 
 	config.addr = addr & ~TLB_16M_WINDOW_MASK;
 	config.x_end = x;
@@ -936,33 +939,79 @@ static u8 __iomem *wh_configure_kernel_tlb(struct wormhole_device *wh, u32 x, u3
 	config.ordering	= 1; // strict
 	config.noc = noc;
 
-	wh_configure_tlb(wh, KERNEL_TLB_INDEX, &config);
-	return wh->bar4_mapping + KERNEL_TLB_START + offset;
+	ret = wh_configure_tlb(wh, KERNEL_TLB_INDEX, &config);
+	if (ret)
+		return ret;
+
+	*tlb_window = wh->bar4_mapping + KERNEL_TLB_START + offset;
+	return 0;
 }
 
-static u32 noc_read32(struct wormhole_device *wh, u32 x, u32 y, u64 addr, int noc) {
-	u32 val;
+static int wormhole_noc_read(struct tenstorrent_device *tt_dev, u32 x, u32 y, u64 addr, void *value, u32 width, int noc)
+{
+	struct wormhole_device *wh = tt_dev_to_wh_dev(tt_dev);
 	u8 __iomem *tlb_window;
+	int ret = 0;
 
 	mutex_lock(&wh->kernel_tlb_mutex);
 
-	tlb_window = wh_configure_kernel_tlb(wh, x, y, addr, noc);
-	val = ioread32(tlb_window);
+	ret = wh_configure_kernel_tlb(wh, x, y, addr, noc, &tlb_window);
+	if (ret)
+		goto out;
 
+	switch (width) {
+	case 1: *(u8  *)value = ioread8(tlb_window);  break;
+	case 2: *(u16 *)value = ioread16(tlb_window); break;
+	case 4: *(u32 *)value = ioread32(tlb_window); break;
+	case 8: *(u64 *)value = ioread64(tlb_window); break;
+	default: ret = -EINVAL; break;
+	}
+
+out:
 	mutex_unlock(&wh->kernel_tlb_mutex);
+
+	return ret;
+}
+
+static int wormhole_noc_write(struct tenstorrent_device *tt_dev, u32 x, u32 y, u64 addr, const void *value, u32 width,
+			      int noc)
+{
+	struct wormhole_device *wh = tt_dev_to_wh_dev(tt_dev);
+	u8 __iomem *tlb_window;
+	int ret = 0;
+
+	mutex_lock(&wh->kernel_tlb_mutex);
+
+	ret = wh_configure_kernel_tlb(wh, x, y, addr, noc, &tlb_window);
+	if (ret)
+		goto out;
+
+	switch (width) {
+	case 1: iowrite8(*(const u8  *)value, tlb_window);  break;
+	case 2: iowrite16(*(const u16 *)value, tlb_window); break;
+	case 4: iowrite32(*(const u32 *)value, tlb_window); break;
+	case 8: iowrite64(*(const u64 *)value, tlb_window); break;
+	default: ret = -EINVAL; break;
+	}
+
+out:
+	mutex_unlock(&wh->kernel_tlb_mutex);
+
+	return ret;
+}
+
+static u32 noc_read32(struct wormhole_device *wh, u32 x, u32 y, u64 addr, int noc)
+{
+	u32 val = 0;
+
+	wormhole_noc_read(&wh->tt, x, y, addr, &val, sizeof(val), noc);
 
 	return val;
 }
 
-static void noc_write32(struct wormhole_device *wh, u32 x, u32 y, u64 addr, u32 data, int noc) {
-	u8 __iomem *tlb_window;
-
-	mutex_lock(&wh->kernel_tlb_mutex);
-
-	tlb_window = wh_configure_kernel_tlb(wh, x, y, addr, noc);
-	iowrite32(data, tlb_window);
-
-	mutex_unlock(&wh->kernel_tlb_mutex);
+static void noc_write32(struct wormhole_device *wh, u32 x, u32 y, u64 addr, u32 data, int noc)
+{
+	wormhole_noc_write(&wh->tt, x, y, addr, &data, sizeof(data), noc);
 }
 
 // open_dbi disrupts normal NOC DMA because all outbound traffic are routed to DBI
@@ -1084,6 +1133,8 @@ struct tenstorrent_device_class wormhole_class = {
 	.restore_reset_state = wormhole_restore_reset_state,
 	.configure_outbound_atu = wormhole_configure_outbound_atu,
 	.noc_write32 = wormhole_noc_write32,
+	.noc_read = wormhole_noc_read,
+	.noc_write = wormhole_noc_write,
 	.csm_read32 = wormhole_csm_read32,
 	.csm_write32 = wormhole_csm_write32,
 	.arc_msg_locate_queue = wormhole_arc_msg_locate_queue,
