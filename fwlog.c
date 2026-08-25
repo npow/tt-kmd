@@ -4,6 +4,7 @@
 #include <linux/compiler.h>
 #include <linux/dma-mapping.h>
 #include <linux/kernel.h>
+#include <linux/sched.h>
 #include <linux/string.h>
 
 #include "fwlog_kmd.h"
@@ -20,6 +21,8 @@ static void fw_log_emit_to_kernel(void *ctx, const struct fw_log_record *rec)
 {
 	struct device *dev = ctx;
 	const char *source_str = fw_log_source_str(rec->source);
+
+	cond_resched();
 
 	if (rec->seq_gap)
 		dev_warn(dev, "FW log: sequence gap (expected %u, got %u)\n",
@@ -184,5 +187,5 @@ void fw_log_free(struct fw_log_state *log)
 void fw_log_interrupt(struct fw_log_state *log)
 {
 	if (READ_ONCE(log->enabled))
-		schedule_work(&log->work);
+		queue_work(system_unbound_wq, &log->work);
 }
