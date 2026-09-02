@@ -39,6 +39,8 @@ struct tenstorrent_device {
 	const struct tenstorrent_device_class *dev_class;
 	bool detached; // No longer valid for hardware access
 	bool needs_hw_init;
+	bool pci_enabled; // Tracks the pci_enable_device()/disable balance
+	bool pci_error_recovery_active; // Makes repeated AER failure callbacks idempotent
 	atomic_long_t reset_gen; // Generation counter, incremented on reset
 	struct rw_semaphore reset_rwsem;
 	struct dentry *debugfs_root;
@@ -114,6 +116,10 @@ struct tenstorrent_device_class {
 	bool (*init_hardware)(struct tenstorrent_device *ttdev);
 	bool (*init_telemetry)(struct tenstorrent_device *ttdev);
 	void (*cleanup_telemetry)(struct tenstorrent_device *ttdev);
+	// Stop driver-side asynchronous work without accessing the device. This
+	// is safe to call while PCIe has isolated the endpoint during AER/DPC
+	// recovery, after interrupts have been disabled.
+	void (*quiesce_device_work)(struct tenstorrent_device *ttdev);
 	void (*cleanup_hardware)(struct tenstorrent_device *ttdev);
 	void (*cleanup_device)(struct tenstorrent_device *ttdev);
 	void (*reboot)(struct tenstorrent_device *ttdev);

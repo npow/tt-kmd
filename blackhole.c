@@ -800,6 +800,14 @@ static void blackhole_cleanup_telemetry(struct tenstorrent_device *tt_dev)
 	}
 }
 
+static void blackhole_quiesce_device_work(struct tenstorrent_device *tt_dev)
+{
+	// This is deliberately the software-only half of firmware-log teardown.
+	// The endpoint may be inaccessible during AER/DPC recovery, so do not send
+	// the firmware release message here.
+	fw_log_quiesce(&tt_dev->fw_log);
+}
+
 static void blackhole_cleanup_hardware(struct tenstorrent_device *tt_dev)
 {
 	struct blackhole_device *bh = tt_dev_to_bh_dev(tt_dev);
@@ -945,6 +953,7 @@ struct tenstorrent_device_class blackhole_class = {
 	.read_telemetry_tag = blackhole_read_telemetry_tag,
 	.populate_telemetry_cache = blackhole_populate_telemetry_cache,
 	.probe_telemetry = tt_telemetry_probe,
+	.quiesce_device_work = blackhole_quiesce_device_work,
 	.cleanup_hardware = blackhole_cleanup_hardware,
 	.cleanup_device = blackhole_cleanup,
 	.configure_tlb = blackhole_configure_tlb,

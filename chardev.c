@@ -256,6 +256,28 @@ static void tenstorrent_reset_reclaim_tlbs(struct tenstorrent_device *tt_dev)
 	mutex_unlock(&tt_dev->chardev_mutex);
 }
 
+// Invalidate all userspace state after a reset that was initiated outside an
+// ioctl, such as PCIe AER recovery. Unlike bump_reset_gen(), there is no
+// resetting fd to preserve: every fd that could have observed the pre-reset
+// device must reopen before it can access hardware again.
+//
+// Caller holds reset_rwsem exclusive, which prevents open/release/ioctl/mmap
+// from racing the generation change or the resource reclamation below.
+void tenstorrent_invalidate_open_fds_for_reset(struct tenstorrent_device *tt_dev)
+{
+	atomic_long_inc(&tt_dev->reset_gen);
+	arc_msg_reset_scrub(tt_dev);
+
+	tenstorrent_vma_zap(tt_dev);
+	tenstorrent_reset_reclaim_tlbs(tt_dev);
+	tenstorrent_reset_reclaim_iatus(tt_dev);
+	tenstorrent_revoke_tlb_dmabufs(tt_dev);
+
+	// LOCK_CTL waiters drop reset_rwsem while sleeping. Wake them so they
+	// observe the generation mismatch and return -ENODEV.
+	wake_up_interruptible(&tt_dev->resource_lock_waitqueue);
+}
+
 static long ioctl_reset_device(struct chardev_private *priv,
 			       struct tenstorrent_reset_device __user *arg)
 {

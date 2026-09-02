@@ -22,6 +22,7 @@
 #include "chardev_private.h"
 #include "wormhole.h"
 #include "tlb.h"
+#include "pcie.h"
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0) || TT_RHEL_RELEASE_GE(9, 4)
 #define pci_enable_pcie_error_reporting(dev) do { } while (0)
@@ -305,6 +306,8 @@ static int tenstorrent_pci_probe(struct pci_dev *dev, const struct pci_device_id
 
 	tt_dev->detached = false;
 	tt_dev->needs_hw_init = true;
+	tt_dev->pci_enabled = true;
+	tt_dev->pci_error_recovery_active = false;
 	tt_dev->dev_class = device_class;
 	tt_dev->pdev = pci_dev_get(dev);
 	tt_dev->ordinal = ordinal;
@@ -406,12 +409,13 @@ fail_init_device:
 	tenstorrent_disable_interrupts(tt_dev);
 	pci_disable_pcie_error_reporting(dev);
 	pci_set_drvdata(dev, NULL);
+	pci_disable_device(dev);
+	tt_dev->pci_enabled = false;
 	pci_dev_put(dev);
 	xa_erase(&tenstorrent_dev_xa, ordinal);
 	// Direct kfree: this path runs before tenstorrent_register_device,
 	// so tt_dev->dev is not yet initialized and cannot be put_device'd.
 	kfree(tt_dev);
-	pci_disable_device(dev);
 	return err;
 }
 
@@ -442,7 +446,8 @@ static void tenstorrent_pci_remove(struct pci_dev *dev)
 	// if it is still accessible by reading the vendor ID. If it is not, skip
 	// cleanup_hardware (which requires device access).
 	pci_read_config_word(dev, PCI_VENDOR_ID, &vendor_id);
-	if (vendor_id != U16_MAX)
+	if (vendor_id != U16_MAX && tt_dev->pci_enabled &&
+	    !tt_dev->pci_error_recovery_active)
 		tt_dev->dev_class->cleanup_hardware(tt_dev);
 
 	// Disable interrupts before cleanup_device(). A device-class interrupt
@@ -485,7 +490,10 @@ static void tenstorrent_pci_remove(struct pci_dev *dev)
 	tenstorrent_unregister_device(tt_dev);
 
 	pci_disable_pcie_error_reporting(dev);
-	pci_disable_device(dev);
+	if (tt_dev->pci_enabled) {
+		pci_disable_device(dev);
+		tt_dev->pci_enabled = false;
+	}
 
 	pci_set_drvdata(dev, NULL);
 
@@ -548,6 +556,159 @@ static int tenstorrent_resume(struct device *dev) {
 
 static SIMPLE_DEV_PM_OPS(tenstorrent_pm_ops, tenstorrent_suspend, tenstorrent_resume);
 
+static pci_ers_result_t tenstorrent_pci_error_detected(struct pci_dev *pdev,
+						       pci_channel_state_t state)
+{
+	struct tenstorrent_device *tt_dev = pci_get_drvdata(pdev);
+
+	if (!tt_dev)
+		return PCI_ERS_RESULT_DISCONNECT;
+
+	dev_warn(&pdev->dev, "PCIe channel error detected (state %d); quiescing device\n",
+		 state);
+
+	// Fence all device access first. The delayed power work does not take
+	// reset_rwsem, but open/release cannot arm it while this write hold is
+	// active, so cancelling under the hold closes that race.
+	down_write(&tt_dev->reset_rwsem);
+	if (tt_dev->pci_error_recovery_active) {
+		up_write(&tt_dev->reset_rwsem);
+		return state == pci_channel_io_perm_failure ?
+			PCI_ERS_RESULT_DISCONNECT : PCI_ERS_RESULT_NEED_RESET;
+	}
+	tt_dev->pci_error_recovery_active = true;
+	tt_dev->needs_hw_init = true;
+	cancel_delayed_work_sync(&tt_dev->power_down_work);
+
+	// The endpoint may already be inaccessible. Only stop host-side activity;
+	// cleanup_hardware() is intentionally not called because it performs MMIO
+	// and firmware messaging.
+	tenstorrent_disable_interrupts(tt_dev);
+	if (tt_dev->dev_class->quiesce_device_work)
+		tt_dev->dev_class->quiesce_device_work(tt_dev);
+
+	tenstorrent_invalidate_open_fds_for_reset(tt_dev);
+
+	// Balance the pci_enable_device_mem() in slot_reset() and stop the device
+	// from initiating new transactions until the PCI core resets the link.
+	if (tt_dev->pci_enabled) {
+		pci_clear_master(pdev);
+		pci_disable_device(pdev);
+		tt_dev->pci_enabled = false;
+	}
+	up_write(&tt_dev->reset_rwsem);
+
+	if (state == pci_channel_io_perm_failure)
+		return PCI_ERS_RESULT_DISCONNECT;
+
+	return PCI_ERS_RESULT_NEED_RESET;
+}
+
+static pci_ers_result_t tenstorrent_pci_slot_reset(struct pci_dev *pdev)
+{
+	struct tenstorrent_device *tt_dev = pci_get_drvdata(pdev);
+	bool interrupts_enabled = false;
+	bool ok = false;
+	int ret;
+
+	if (!tt_dev)
+		return PCI_ERS_RESULT_DISCONNECT;
+
+	if (!tt_dev->pci_enabled) {
+		ret = pci_enable_device_mem(pdev);
+		if (ret) {
+			dev_err(&pdev->dev, "Failed to re-enable PCI device after reset: %d\n",
+				 ret);
+			return PCI_ERS_RESULT_DISCONNECT;
+		}
+		tt_dev->pci_enabled = true;
+	}
+
+	down_write(&tt_dev->reset_rwsem);
+
+	if (!safe_pci_restore_state(pdev)) {
+		dev_err(&pdev->dev, "Failed to restore PCI configuration after reset\n");
+		goto out;
+	}
+	pci_set_master(pdev);
+
+	tt_dev->dev_class->restore_reset_state(tt_dev);
+
+	// Establish the interrupt handler before init_hardware() enables firmware
+	// features that can signal through MSI.
+	interrupts_enabled = tenstorrent_enable_interrupts(tt_dev);
+	if (!interrupts_enabled)
+		dev_warn(&pdev->dev, "Unable to re-enable interrupts after PCIe recovery\n");
+
+	if (!tt_dev->dev_class->init_hardware(tt_dev)) {
+		dev_err(&pdev->dev, "Hardware reinitialization failed after PCIe reset\n");
+		goto out;
+	}
+
+	if (tt_dev->dev_class->probe_telemetry) {
+		ret = tt_dev->dev_class->probe_telemetry(tt_dev);
+		if (ret)
+			dev_warn(&pdev->dev, "Telemetry reprobe failed after PCIe reset: %d\n",
+				 ret);
+	}
+
+	pci_save_state(pdev);
+	tt_dev->needs_hw_init = false;
+	ok = true;
+
+out:
+	up_write(&tt_dev->reset_rwsem);
+
+	if (!ok) {
+		if (interrupts_enabled)
+			tenstorrent_disable_interrupts(tt_dev);
+		if (tt_dev->pci_enabled) {
+			pci_clear_master(pdev);
+			pci_disable_device(pdev);
+			tt_dev->pci_enabled = false;
+		}
+		return PCI_ERS_RESULT_DISCONNECT;
+	}
+
+	return PCI_ERS_RESULT_RECOVERED;
+}
+
+static void tenstorrent_pci_error_resume(struct pci_dev *pdev)
+{
+	struct tenstorrent_device *tt_dev = pci_get_drvdata(pdev);
+	int ret;
+
+	if (!tt_dev)
+		return;
+
+	down_write(&tt_dev->reset_rwsem);
+	if (tt_dev->needs_hw_init) {
+		up_write(&tt_dev->reset_rwsem);
+		return;
+	}
+	tt_dev->pci_error_recovery_active = false;
+	up_write(&tt_dev->reset_rwsem);
+
+	// All pre-reset fds are stale, so this normally returns the device to its
+	// no-client power state. A userspace policy daemon can reapply board-level
+	// limits in response to the standard KOBJ_CHANGE event below.
+	if (power_policy) {
+		ret = tenstorrent_set_aggregated_power_state(tt_dev);
+		if (ret)
+			dev_warn(&pdev->dev, "Failed to restore aggregated power state: %d\n",
+				 ret);
+	}
+
+	kobject_uevent(&tt_dev->dev.kobj, KOBJ_CHANGE);
+	dev_info(&pdev->dev, "PCIe error recovery complete\n");
+}
+
+static const struct pci_error_handlers tenstorrent_pci_error_handlers = {
+	.error_detected = tenstorrent_pci_error_detected,
+	.slot_reset = tenstorrent_pci_slot_reset,
+	.resume = tenstorrent_pci_error_resume,
+};
+
 extern const struct pci_device_id tenstorrent_ids[];
 static struct pci_driver tenstorrent_pci_driver = {
 	.name = TENSTORRENT,
@@ -555,6 +716,7 @@ static struct pci_driver tenstorrent_pci_driver = {
 	.probe = tenstorrent_pci_probe,
 	.remove = tenstorrent_pci_remove,
 	.shutdown = tenstorrent_pci_remove,
+	.err_handler = &tenstorrent_pci_error_handlers,
 
 	.driver.pm = &tenstorrent_pm_ops,
 };
