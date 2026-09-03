@@ -54,7 +54,7 @@ MODULE_PARM_DESC(auto_reset_timeout,
 unsigned char blackhole_auto_reset_timeout;
 module_param(blackhole_auto_reset_timeout, byte, 0444);
 MODULE_PARM_DESC(blackhole_auto_reset_timeout,
-		 "Blackhole watchdog (seconds, default 0/off); resets ASIC/PCIe; requires qualified recovery.");
+		 "Blackhole watchdog (seconds, default 0/off); resets and recovers a stalled ASIC.");
 
 bool power_policy = true;
 module_param(power_policy, bool, 0444);

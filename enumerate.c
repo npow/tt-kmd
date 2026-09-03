@@ -12,6 +12,7 @@
 #include <linux/seq_file.h>
 #include <linux/debugfs.h>
 #include <linux/proc_fs.h>
+#include <linux/delay.h>
 
 #include "enumerate.h"
 #include "interrupt.h"
@@ -32,6 +33,9 @@
 #endif
 
 static DEFINE_XARRAY_ALLOC(tenstorrent_dev_xa);
+
+#define BLACKHOLE_WATCHDOG_MONITOR_MS 500
+#define BLACKHOLE_WATCHDOG_RESET_SETTLE_MS 2000
 
 // Galaxy systems have 32 Tenstorrent chips across 4 boards with 8 chips each.
 // The high nibble of the PCI bus number identifies the board; the low nibble
@@ -256,6 +260,142 @@ static int tenstorrent_reboot_notifier(struct notifier_block *nb,
 	return NOTIFY_DONE;
 }
 
+static void tenstorrent_watchdog_monitor_rearm(struct tenstorrent_device *tt_dev)
+{
+	if (READ_ONCE(tt_dev->watchdog_monitor_enabled))
+		schedule_delayed_work(&tt_dev->watchdog_monitor_work,
+				      msecs_to_jiffies(BLACKHOLE_WATCHDOG_MONITOR_MS));
+}
+
+static void tenstorrent_watchdog_monitor_work_func(struct work_struct *work)
+{
+	struct tenstorrent_device *tt_dev = container_of(to_delayed_work(work),
+							 struct tenstorrent_device,
+							 watchdog_monitor_work);
+	struct pci_dev *pdev = tt_dev->pdev;
+	bool interrupts_enabled = false;
+	bool ok;
+	u16 command;
+	int ret;
+
+	if (!READ_ONCE(tt_dev->watchdog_monitor_enabled))
+		return;
+
+	/*
+	 * Config-space reads remain safe when the endpoint BAR/NOC is hung.  A
+	 * watchdog reset clears Memory Space and Bus Master Enable, while an
+	 * ordinary running Blackhole has both bits set.  Do not wait behind a
+	 * user reset or PCI error recovery; their completion paths own recovery.
+	 */
+	if (!down_write_trylock(&tt_dev->reset_rwsem))
+		goto rearm;
+
+	if (tt_dev->detached || !tt_dev->pci_enabled) {
+		WRITE_ONCE(tt_dev->watchdog_monitor_enabled, false);
+		goto unlock;
+	}
+
+	if (tt_dev->needs_hw_init || tt_dev->pci_error_recovery_active ||
+	    pci_channel_offline(pdev))
+		goto unlock_rearm;
+
+	ret = pci_read_config_word(pdev, PCI_COMMAND, &command);
+	if (ret != PCIBIOS_SUCCESSFUL || command == U16_MAX)
+		goto unlock_rearm;
+
+	if ((command & (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER)) ==
+	    (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER))
+		goto unlock_rearm;
+
+	/*
+	 * The endpoint reset happened outside the reset ioctl, so every existing
+	 * fd, mmap, TLB, iATU and dma-buf refers to destroyed hardware state.
+	 * Fence them before restoring PCI_COMMAND or touching a BAR.
+	 */
+	dev_warn(&pdev->dev,
+		 "Autonomous reset detected (PCI_COMMAND %#x); recovering device\n",
+		 command);
+	tt_dev->needs_hw_init = true;
+	cancel_delayed_work(&tt_dev->power_down_work);
+	tenstorrent_disable_interrupts(tt_dev);
+	if (tt_dev->dev_class->quiesce_device_work)
+		tt_dev->dev_class->quiesce_device_work(tt_dev);
+	tenstorrent_invalidate_open_fds_for_reset(tt_dev);
+
+	/* Let DMC finish resetting and booting ARC before any BAR/NOC access. */
+	msleep(BLACKHOLE_WATCHDOG_RESET_SETTLE_MS);
+
+	if (pci_channel_offline(pdev) || tt_dev->pci_error_recovery_active)
+		goto recovery_failed;
+
+	if (!safe_pci_restore_state(pdev))
+		goto recovery_failed;
+
+	pci_set_master(pdev);
+	tt_dev->dev_class->restore_reset_state(tt_dev);
+
+	interrupts_enabled = tenstorrent_enable_interrupts(tt_dev);
+	if (!interrupts_enabled)
+		dev_warn(&pdev->dev,
+			 "Unable to re-enable interrupts after autonomous reset\n");
+
+	ok = tt_dev->dev_class->init_hardware(tt_dev);
+	if (!ok)
+		goto recovery_failed;
+
+	if (tt_dev->dev_class->probe_telemetry)
+		tt_dev->dev_class->probe_telemetry(tt_dev);
+
+	pci_save_state(pdev);
+	tt_dev->needs_hw_init = false;
+
+	if (power_policy) {
+		ret = tenstorrent_set_aggregated_power_state(tt_dev);
+		if (ret)
+			dev_warn(&pdev->dev,
+				 "Failed to restore aggregated power state: %d\n", ret);
+	}
+
+	kobject_uevent(&tt_dev->dev.kobj, KOBJ_CHANGE);
+	dev_info(&pdev->dev, "Autonomous reset recovery complete\n");
+	goto unlock_rearm;
+
+recovery_failed:
+	if (interrupts_enabled)
+		tenstorrent_disable_interrupts(tt_dev);
+	if (!pci_channel_offline(pdev))
+		pci_clear_master(pdev);
+	WRITE_ONCE(tt_dev->watchdog_monitor_enabled, false);
+	dev_err(&pdev->dev,
+		"Autonomous reset recovery failed; device remains fenced\n");
+	goto unlock;
+
+unlock_rearm:
+	up_write(&tt_dev->reset_rwsem);
+rearm:
+	tenstorrent_watchdog_monitor_rearm(tt_dev);
+	return;
+
+unlock:
+	up_write(&tt_dev->reset_rwsem);
+}
+
+static void tenstorrent_watchdog_monitor_start(struct tenstorrent_device *tt_dev)
+{
+	if (tt_dev->pdev->device != PCI_DEVICE_ID_BLACKHOLE ||
+	    blackhole_auto_reset_timeout == 0 || tt_dev->needs_hw_init)
+		return;
+
+	WRITE_ONCE(tt_dev->watchdog_monitor_enabled, true);
+	tenstorrent_watchdog_monitor_rearm(tt_dev);
+}
+
+static void tenstorrent_watchdog_monitor_stop(struct tenstorrent_device *tt_dev)
+{
+	WRITE_ONCE(tt_dev->watchdog_monitor_enabled, false);
+	cancel_delayed_work_sync(&tt_dev->watchdog_monitor_work);
+}
+
 static int tenstorrent_pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
 {
 	struct tenstorrent_device *tt_dev = NULL;
@@ -326,6 +466,8 @@ static int tenstorrent_pci_probe(struct pci_dev *dev, const struct pci_device_id
 	INIT_LIST_HEAD(&tt_dev->arc_msg_queue);
 	INIT_LIST_HEAD(&tt_dev->dmabuf_exports);
 	INIT_DELAYED_WORK(&tt_dev->power_down_work, tenstorrent_power_down_work_func);
+	INIT_DELAYED_WORK(&tt_dev->watchdog_monitor_work,
+			  tenstorrent_watchdog_monitor_work_func);
 
 	// The coherent DMA mask (ALLOCATE_DMA_BUF) comes from the device class.
 	// Wormhole is 32 because legacy software assumes it will get 32-bit
@@ -405,6 +547,8 @@ static int tenstorrent_pci_probe(struct pci_dev *dev, const struct pci_device_id
 	if (power_policy && !tt_dev->needs_hw_init)
 		tenstorrent_set_aggregated_power_state(tt_dev);
 
+	tenstorrent_watchdog_monitor_start(tt_dev);
+
 	return 0;
 
 fail_init_device:
@@ -427,9 +571,6 @@ static void tenstorrent_pci_remove(struct pci_dev *dev)
 	struct chardev_private *priv;
 	u16 vendor_id;
 
-	// Tear down telemetry first.
-	tt_telemetry_cleanup(tt_dev);
-
 	// Fence deferred-powerdown arming before draining.  tt_cdev_release
 	// arms power_down_work under chardev_mutex only when it observes
 	// !detached, so writing detached=true here under the same mutex
@@ -442,7 +583,11 @@ static void tenstorrent_pci_remove(struct pci_dev *dev)
 	tt_dev->detached = true;
 	mutex_unlock(&tt_dev->chardev_mutex);
 
+	tenstorrent_watchdog_monitor_stop(tt_dev);
 	cancel_delayed_work_sync(&tt_dev->power_down_work);
+
+	// No monitor can repopulate the telemetry cache after this teardown.
+	tt_telemetry_cleanup(tt_dev);
 
 	// In a hotplug scenario, the device may not be accessible anymore. Check
 	// if it is still accessible by reading the vendor ID. If it is not, skip
@@ -525,6 +670,7 @@ static int tenstorrent_suspend(struct device *dev) {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct tenstorrent_device *tt_dev = pci_get_drvdata(pdev);
 
+	tenstorrent_watchdog_monitor_stop(tt_dev);
 	cancel_delayed_work_sync(&tt_dev->power_down_work);
 	tenstorrent_revoke_tlb_dmabufs(tt_dev);
 
@@ -562,6 +708,9 @@ static int tenstorrent_resume(struct device *dev) {
 		tenstorrent_disable_interrupts(tt_dev);
 
 	up_write(&tt_dev->reset_rwsem);
+
+	if (ok)
+		tenstorrent_watchdog_monitor_start(tt_dev);
 
 	return ok ? 0 : -EIO;
 }

@@ -74,6 +74,13 @@ struct tenstorrent_device {
 	// an in-flight FW message cannot race cleanup_hardware.
 	struct delayed_work power_down_work;
 
+	// Blackhole's DMC watchdog resets the endpoint without necessarily
+	// producing an AER/DPC event.  Monitor PCI config space so the driver can
+	// fence stale mappings and restore the saved device state without probing
+	// a potentially hung BAR.
+	struct delayed_work watchdog_monitor_work;
+	bool watchdog_monitor_enabled;
+
 	DECLARE_BITMAP(tlbs, TENSTORRENT_MAX_INBOUND_TLBS);
 	u32 tlb_counts[MAX_TLB_KINDS];	// Per-device TLB counts (may differ from dev_class defaults)
 	refcount_t tlb_refcount[TENSTORRENT_MAX_INBOUND_TLBS];
