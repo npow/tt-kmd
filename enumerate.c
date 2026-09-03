@@ -583,9 +583,15 @@ static pci_ers_result_t tenstorrent_pci_error_detected(struct pci_dev *pdev,
 	// active, so cancelling under the hold closes that race.
 	down_write(&tt_dev->reset_rwsem);
 	if (tt_dev->pci_error_recovery_active) {
+		/*
+		 * A previous recovery has not reached resume().  In particular, this
+		 * is the state left behind when slot_reset() could not reinitialize
+		 * the ASIC.  Asking for another reset here makes DPC repeatedly bring
+		 * up an unrecoverable link and call slot_reset() again.  Keep the
+		 * endpoint fenced until an explicit remove/reprobe instead.
+		 */
 		up_write(&tt_dev->reset_rwsem);
-		return state == pci_channel_io_perm_failure ?
-			PCI_ERS_RESULT_DISCONNECT : PCI_ERS_RESULT_NEED_RESET;
+		return PCI_ERS_RESULT_DISCONNECT;
 	}
 	tt_dev->pci_error_recovery_active = true;
 	tt_dev->needs_hw_init = true;
