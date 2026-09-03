@@ -308,6 +308,7 @@ static int tenstorrent_pci_probe(struct pci_dev *dev, const struct pci_device_id
 	tt_dev->needs_hw_init = true;
 	tt_dev->pci_enabled = true;
 	tt_dev->pci_error_recovery_active = false;
+	tt_dev->pci_error_recovery_failed = false;
 	tt_dev->dev_class = device_class;
 	tt_dev->pdev = pci_dev_get(dev);
 	tt_dev->ordinal = ordinal;
@@ -584,16 +585,18 @@ static pci_ers_result_t tenstorrent_pci_error_detected(struct pci_dev *pdev,
 	down_write(&tt_dev->reset_rwsem);
 	if (tt_dev->pci_error_recovery_active) {
 		/*
-		 * A previous recovery has not reached resume().  In particular, this
-		 * is the state left behind when slot_reset() could not reinitialize
-		 * the ASIC.  Asking for another reset here makes DPC repeatedly bring
-		 * up an unrecoverable link and call slot_reset() again.  Keep the
-		 * endpoint fenced until an explicit remove/reprobe instead.
+		 * The PCI core reports permanent failure after it has finished link
+		 * recovery. Record that transition so an explicit config-space reset
+		 * cannot race DPC while it is still handling the frozen link.
 		 */
+		if (state == pci_channel_io_perm_failure)
+			tt_dev->pci_error_recovery_failed = true;
 		up_write(&tt_dev->reset_rwsem);
 		return PCI_ERS_RESULT_DISCONNECT;
 	}
 	tt_dev->pci_error_recovery_active = true;
+	tt_dev->pci_error_recovery_failed =
+		state == pci_channel_io_perm_failure;
 	tt_dev->needs_hw_init = true;
 	cancel_delayed_work_sync(&tt_dev->power_down_work);
 
@@ -616,6 +619,18 @@ static pci_ers_result_t tenstorrent_pci_error_detected(struct pci_dev *pdev,
 	up_write(&tt_dev->reset_rwsem);
 
 	if (state == pci_channel_io_perm_failure)
+		return PCI_ERS_RESULT_DISCONNECT;
+
+	/*
+	 * A frozen Blackhole endpoint may have lost its internal NOC while its
+	 * PCIe link is still recoverable. The PCI core resets a frozen link even
+	 * when the driver returns DISCONNECT, but does not call slot_reset().
+	 * Avoid probing BAR/NOC state there: that probe can itself cause another
+	 * Completion Timeout and DPC event. Leave the endpoint fenced for an
+	 * explicit config-space ASIC reset or remove/reprobe.
+	 */
+	if (state == pci_channel_io_frozen &&
+	    pdev->device == PCI_DEVICE_ID_BLACKHOLE)
 		return PCI_ERS_RESULT_DISCONNECT;
 
 	return PCI_ERS_RESULT_NEED_RESET;
@@ -704,6 +719,7 @@ static void tenstorrent_pci_error_resume(struct pci_dev *pdev)
 		return;
 	}
 	tt_dev->pci_error_recovery_active = false;
+	tt_dev->pci_error_recovery_failed = false;
 	up_write(&tt_dev->reset_rwsem);
 
 	// All pre-reset fds are stale, so this normally returns the device to its

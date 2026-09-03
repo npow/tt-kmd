@@ -40,7 +40,8 @@ struct tenstorrent_device {
 	bool detached; // No longer valid for hardware access
 	bool needs_hw_init;
 	bool pci_enabled; // Tracks the pci_enable_device()/disable balance
-	bool pci_error_recovery_active; // Makes repeated AER failure callbacks idempotent
+	bool pci_error_recovery_active; // Protected by reset_rwsem
+	bool pci_error_recovery_failed; // PCI core reported permanent failure
 	atomic_long_t reset_gen; // Generation counter, incremented on reset
 	struct rw_semaphore reset_rwsem;
 	struct dentry *debugfs_root;

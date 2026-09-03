@@ -294,6 +294,20 @@ static long ioctl_reset_device(struct chardev_private *priv,
 	if (copy_from_user(&in, &arg->in, sizeof(in)) != 0)
 		return -EFAULT;
 
+	/*
+	 * A permanently fenced Blackhole can only be reset through PCI config
+	 * space. In particular, ASIC_DMC_RESET sends an ARC message over BAR/NOC
+	 * and can cause another Completion Timeout. Do not attempt to unfence the
+	 * existing device here; recovery must be completed by remove/reprobe.
+	 */
+	if (tt_dev->pci_error_recovery_active) {
+		if (!tt_dev->pci_error_recovery_failed)
+			return -EAGAIN;
+		if (pdev->device != PCI_DEVICE_ID_BLACKHOLE ||
+		    in.flags != TENSTORRENT_RESET_DEVICE_ASIC_RESET)
+			return -EOPNOTSUPP;
+	}
+
 	// Refuse a destructive in-place reset while any TLB window is exported as
 	// a dma-buf: an importer may be doing peer-to-peer DMA into it, and a
 	// pin-only importer cannot be revoked to make the reset safe. See the
@@ -882,15 +896,17 @@ static long tt_cdev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	}
 
 	/*
-	 * AER leaves recovery_active set until resume() completes, or
-	 * permanently when slot_reset() cannot reinitialize the device. Do not
-	 * let a newly opened fd reach BARs or firmware in either window. Cached
-	 * identity queries remain useful for diagnosing a fenced endpoint.
+	 * AER leaves recovery_active set until resume() completes, or permanently
+	 * when recovery fails or a frozen Blackhole is fenced. Do not let a newly
+	 * opened fd reach BARs or firmware in either window. Cached identity queries
+	 * remain useful for diagnosing a fenced endpoint.
 	 */
 	if (priv->device->pci_error_recovery_active ||
 	    !priv->device->pci_enabled) {
 		bool allowed = (cmd == TENSTORRENT_IOCTL_GET_DEVICE_INFO ||
-				cmd == TENSTORRENT_IOCTL_GET_DRIVER_INFO);
+				cmd == TENSTORRENT_IOCTL_GET_DRIVER_INFO ||
+				(cmd == TENSTORRENT_IOCTL_RESET_DEVICE &&
+				 priv->device->pci_error_recovery_failed));
 
 		if (!allowed) {
 			ret = -ENODEV;
