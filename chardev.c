@@ -716,18 +716,28 @@ int tenstorrent_set_aggregated_power_state(struct tenstorrent_device *tt_dev)
 }
 
 // Delayed work: send the aggregated idle power-down message after the
-// grace period elapses with no open fds.  Safe to run unguarded:
-// tt_cdev_release only arms this under chardev_mutex when !detached,
-// and tenstorrent_pci_remove writes detached=true under the same mutex
-// before cancel_delayed_work_sync, so the handler cannot fire after
-// teardown begins.
+// grace period elapses with no open fds.
 void tenstorrent_power_down_work_func(struct work_struct *work)
 {
 	struct tenstorrent_device *tt_dev = container_of(to_delayed_work(work),
 							 struct tenstorrent_device,
 							 power_down_work);
 
-	tenstorrent_set_aggregated_power_state(tt_dev);
+	/*
+	 * Avoid waiting behind reset_rwsem while AER holds it and drains this
+	 * work. A queued idle transition is optional; recovery or reset will
+	 * establish the device's next power state explicitly.
+	 */
+	if (!down_read_trylock(&tt_dev->reset_rwsem)) {
+		return;
+	}
+
+	if (!tt_dev->detached && !tt_dev->needs_hw_init &&
+	    tt_dev->pci_enabled && !tt_dev->pci_error_recovery_active) {
+		tenstorrent_set_aggregated_power_state(tt_dev);
+	}
+
+	up_read(&tt_dev->reset_rwsem);
 }
 
 static long ioctl_set_power_state(struct chardev_private *priv, struct tenstorrent_power_state __user *arg)
@@ -871,6 +881,23 @@ static long tt_cdev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		goto out;
 	}
 
+	/*
+	 * AER leaves recovery_active set until resume() completes, or
+	 * permanently when slot_reset() cannot reinitialize the device. Do not
+	 * let a newly opened fd reach BARs or firmware in either window. Cached
+	 * identity queries remain useful for diagnosing a fenced endpoint.
+	 */
+	if (priv->device->pci_error_recovery_active ||
+	    !priv->device->pci_enabled) {
+		bool allowed = (cmd == TENSTORRENT_IOCTL_GET_DEVICE_INFO ||
+				cmd == TENSTORRENT_IOCTL_GET_DRIVER_INFO);
+
+		if (!allowed) {
+			ret = -ENODEV;
+			goto out;
+		}
+	}
+
 	// During reset window, only allow info queries and reset operations.
 	if (priv->device->needs_hw_init) {
 		bool allowed = (cmd == TENSTORRENT_IOCTL_GET_DEVICE_INFO ||
@@ -995,6 +1022,12 @@ static int tt_cdev_mmap(struct file *file, struct vm_area_struct *vma)
 
 	// File descriptor opened before reset is permanently invalid.
 	if (atomic_long_read(&tt_dev->reset_gen) != priv->open_reset_gen) {
+		ret = -ENODEV;
+		goto out;
+	}
+
+	if (tt_dev->needs_hw_init || !tt_dev->pci_enabled ||
+	    tt_dev->pci_error_recovery_active) {
 		ret = -ENODEV;
 		goto out;
 	}
@@ -1126,7 +1159,8 @@ static int tt_cdev_open(struct inode *inode, struct file *file)
 	    && cancel_delayed_work_sync(&tt_dev->power_down_work))
 		dev_dbg(&tt_dev->pdev->dev, "cancelled pending idle powerdown\n");
 
-	if (!power_aware && !tt_dev->detached && !tt_dev->needs_hw_init) {
+	if (!power_aware && !tt_dev->detached && !tt_dev->needs_hw_init &&
+	    tt_dev->pci_enabled && !tt_dev->pci_error_recovery_active) {
 		ret = tenstorrent_set_aggregated_power_state(tt_dev);
 		if (ret < 0)
 			dev_warn(&tt_dev->pdev->dev, "Failed to set initial power state: %d\n", ret);
@@ -1195,8 +1229,10 @@ static void tt_cdev_release_power(struct chardev_private *priv)
 	no_power_contrib = (priv->power_state.validity == TT_POWER_VALIDITY(15, 0) && priv->power_state.power_flags == 0);
 	last_close = list_empty(&tt_dev->open_fds_list);
 
-	if (tt_dev->detached || tt_dev->needs_hw_init)
+	if (tt_dev->detached || tt_dev->needs_hw_init ||
+	    !tt_dev->pci_enabled || tt_dev->pci_error_recovery_active) {
 		return;
+	}
 
 	if (!power_policy)
 		return;
