@@ -48,7 +48,13 @@ MODULE_PARM_DESC(reset_limit, "Maximum number of times to reset device during bo
 
 unsigned char auto_reset_timeout = 10;
 module_param(auto_reset_timeout, byte, 0444);
-MODULE_PARM_DESC(auto_reset_timeout, "Timeout duration in seconds for M3 auto reset to occur.");
+MODULE_PARM_DESC(auto_reset_timeout,
+		 "Wormhole M3 auto-reset timeout in seconds (default=10).");
+
+unsigned char blackhole_auto_reset_timeout;
+module_param(blackhole_auto_reset_timeout, byte, 0444);
+MODULE_PARM_DESC(blackhole_auto_reset_timeout,
+		 "Blackhole watchdog (seconds, default 0/off); resets ASIC/PCIe; requires qualified recovery.");
 
 bool power_policy = true;
 module_param(power_policy, bool, 0444);

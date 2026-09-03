@@ -735,9 +735,13 @@ static bool blackhole_init_hardware(struct tenstorrent_device *tt_dev)
 	else
 		blackhole_report_cable_fault(bh);
 
+	/*
+	 * Blackhole watchdog expiry causes DMC to full-reset the ASIC and PCIe
+	 * link. Keep this opt-in until platform reset recovery is qualified.
+	 */
 	memset(&msg, 0, sizeof(msg));
 	msg.header = ARC_MSG_TYPE_SET_WDT_TIMEOUT;
-	msg.payload[0] = 1000 * auto_reset_timeout; // Convert seconds to milliseconds
+	msg.payload[0] = 1000 * blackhole_auto_reset_timeout; // Convert seconds to milliseconds
 	if (arc_msg_send_sync(&bh->tt, &msg) != 0)
 		dev_warn(&tt_dev->pdev->dev, "Failed to set ARC watchdog timeout (this is normal for old FW)\n");
 
