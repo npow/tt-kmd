@@ -385,7 +385,8 @@ static int tenstorrent_pci_probe(struct pci_dev *dev, const struct pci_device_id
 	tt_dev->needs_hw_init = !device_class->init_hardware(tt_dev);
 
 	pci_save_state(dev);
-	device_class->save_reset_state(tt_dev);
+	if (!tt_dev->needs_hw_init)
+		device_class->save_reset_state(tt_dev);
 
 	tenstorrent_register_device(tt_dev);
 
@@ -400,7 +401,7 @@ static int tenstorrent_pci_probe(struct pci_dev *dev, const struct pci_device_id
 	debugfs_create_file("mappings", 0444, tt_dev->debugfs_root, tt_dev, &mappings_fops);
 
 	// Set initial low-power state via aggregation logic.
-	if (power_policy)
+	if (power_policy && !tt_dev->needs_hw_init)
 		tenstorrent_set_aggregated_power_state(tt_dev);
 
 	return 0;
@@ -538,18 +539,28 @@ static int tenstorrent_suspend(struct device *dev) {
 static int tenstorrent_resume(struct device *dev) {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct tenstorrent_device *tt_dev = pci_get_drvdata(pdev);
+	bool interrupts_enabled;
 	bool ok;
+
+	down_write(&tt_dev->reset_rwsem);
+	tt_dev->needs_hw_init = true;
 
 	// Re-establish the handler before init_hardware() re-enables firmware
 	// features that signal completion through MSI (such as FW log batches).
-	if (!tenstorrent_enable_interrupts(tt_dev))
+	interrupts_enabled = tenstorrent_enable_interrupts(tt_dev);
+	if (!interrupts_enabled)
 		dev_warn(dev, "Unable to re-enable interrupts after resume\n");
 
 	ok = tt_dev->dev_class->init_hardware(tt_dev);
+	tt_dev->needs_hw_init = !ok;
 
 	// Suspend invalidates the saved state.
 	if (ok)
 		pci_save_state(pdev);
+	else if (interrupts_enabled)
+		tenstorrent_disable_interrupts(tt_dev);
+
+	up_write(&tt_dev->reset_rwsem);
 
 	return ok ? 0 : -EIO;
 }

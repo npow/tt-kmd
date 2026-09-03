@@ -325,6 +325,7 @@ static long ioctl_reset_device(struct chardev_private *priv,
 		} else {
 			ok = false;
 		}
+		priv->device->needs_hw_init = !ok;
 	} else if (in.flags == TENSTORRENT_RESET_DEVICE_RESET_PCIE_LINK) {
 		tenstorrent_vma_zap(tt_dev);
 		ok = pcie_hot_reset_and_restore_state(pdev);
@@ -361,7 +362,6 @@ static long ioctl_reset_device(struct chardev_private *priv,
 		// In the hotplug case, needs_hw_init is false and there is nothing to
 		// do here. Otherwise this was an in-place reset, so re-initialize now.
 		if (priv->device->needs_hw_init) {
-			priv->device->needs_hw_init = false;
 			if (ok && safe_pci_restore_state(pdev)) {
 				priv->device->dev_class->restore_reset_state(priv->device);
 				ok = priv->device->dev_class->init_hardware(priv->device);
@@ -373,6 +373,7 @@ static long ioctl_reset_device(struct chardev_private *priv,
 			} else {
 				ok = false;
 			}
+			priv->device->needs_hw_init = !ok;
 		}
 	} else {
 		return -EINVAL;
@@ -1142,7 +1143,16 @@ static void tt_cdev_release_noc_cleanup(struct chardev_private *priv)
 {
 	struct tenstorrent_device *tt_dev = priv->device;
 
-	if (tt_dev->detached || !priv->noc_cleanup.enabled)
+	/*
+	 * Release holds reset_rwsem shared, so the generation and recovery state
+	 * cannot change between this check and the NOC write. A reset invalidates
+	 * every pre-reset cleanup registration: replaying one against the new
+	 * device generation could corrupt unrelated state after recovery.
+	 */
+	if (!priv->noc_cleanup.enabled || tt_dev->detached ||
+	    tt_dev->needs_hw_init || !tt_dev->pci_enabled ||
+	    tt_dev->pci_error_recovery_active ||
+	    priv->open_reset_gen != atomic_long_read(&tt_dev->reset_gen))
 		return;
 
 	tt_dev->dev_class->noc_write32(tt_dev, priv->noc_cleanup.x, priv->noc_cleanup.y,

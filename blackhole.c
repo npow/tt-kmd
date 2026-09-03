@@ -74,6 +74,7 @@
 #define ARC_MSG_TYPE_POWER_SETTING 0x21
 #define ARC_MSG_TYPE_TEST 0x90
 #define ARC_MSG_TYPE_FW_LOG 0xC7          // TT_SMC_MSG_TT_PCIE_LOG
+#define ARC_MSG_STATUS_ERROR_REPLY 0xFF   // Unsupported or rejected command
 #define ARC_BOOT_STATUS RESET_SCRATCH(2)
 #define ARC_BOOT_STATUS_READY_FOR_MSG 0x1
 #define ARC_ERROR_STATUS0 RESET_SCRATCH(4)
@@ -378,8 +379,11 @@ static void blackhole_restore_reset_state(struct tenstorrent_device *tt_dev) {
 	u32 y = 0;
 	u32 device_control;
 
-	if (!blackhole_detect_pcie_noc_x(bh, &x))
+	if (!blackhole_detect_pcie_noc_x(bh, &x)) {
+		dev_err(&tt_dev->pdev->dev,
+			"Cannot restore PCIe state: active NOC instance is unavailable\n");
 		return;
+	}
 
 	device_control = noc_read32(bh, x, y, PCIE_DBI_ADDR + DBI_DEVICE_CONTROL_DEVICE_STATUS, 0);
 	device_control &= ~PCI_EXP_DEVCTL_PAYLOAD;
@@ -392,8 +396,27 @@ static ssize_t bh_show_pcie_single_counter(struct device *dev, char *buf, u32 co
 	struct tenstorrent_device *tt_dev = dev_get_drvdata(dev);
 	struct blackhole_device *bh = tt_dev_to_bh_dev(tt_dev);
 	u64 offset = NOC_STATUS_OFFSET + (4 * counter_offset) + (noc * NOC1_NOC2AXI_OFFSET);
-	u32 value = ioread32(bh->noc2axi_cfg + offset);
-	return scnprintf(buf, PAGE_SIZE, "%u\n", value);
+	ssize_t ret;
+	u32 value;
+
+	/*
+	 * AER recovery takes this semaphore for write before it marks the device
+	 * unavailable or tears down PCI access. Do not issue a new MMIO read once
+	 * recovery has begun, or before hardware initialization has completed.
+	 */
+	down_read(&tt_dev->reset_rwsem);
+	if (tt_dev->detached) {
+		ret = -ENODEV;
+	} else if (tt_dev->needs_hw_init || !tt_dev->pci_enabled ||
+		   tt_dev->pci_error_recovery_active) {
+		ret = -ENODATA;
+	} else {
+		value = ioread32(bh->noc2axi_cfg + offset);
+		ret = scnprintf(buf, PAGE_SIZE, "%u\n", value);
+	}
+	up_read(&tt_dev->reset_rwsem);
+
+	return ret;
 }
 
 // The pair are for NOC0 and NOC1; counters for each NOC exposed separately.
@@ -726,14 +749,29 @@ static bool blackhole_init_hardware(struct tenstorrent_device *tt_dev)
 	struct blackhole_device *bh = tt_dev_to_bh_dev(tt_dev);
 	struct pci_dev *pdev = tt_dev->pdev;
 	struct arc_msg msg = { 0 };
+	u32 pcie_noc_x;
+	int ret;
+
+	/*
+	 * A valid PCIe NOC instance and a completed ARC exchange are the minimum
+	 * proof that the management path survived a reset. In particular, AER
+	 * must not report recovery based only on responsive PCI config space.
+	 */
+	if (!blackhole_detect_pcie_noc_x(bh, &pcie_noc_x)) {
+		dev_err(&pdev->dev,
+			"Hardware initialization failed: active NOC instance is unavailable\n");
+		return false;
+	}
 
 	pcie_set_readrq(pdev, MAX_MRRS);
 
 	msg.header = ARC_MSG_TYPE_ASIC_STATE0;
-	if (arc_msg_send_sync(&bh->tt, &msg) != 0)
-		dev_err(&tt_dev->pdev->dev, "Failed to send ARC message for A0 state\n");
-	else
-		blackhole_report_cable_fault(bh);
+	ret = arc_msg_send_sync(&bh->tt, &msg);
+	if (ret) {
+		dev_err(&pdev->dev, "Failed to enter ARC A0 state: %d\n", ret);
+		return false;
+	}
+	blackhole_report_cable_fault(bh);
 
 	/*
 	 * Blackhole watchdog expiry causes DMC to full-reset the ASIC and PCIe
@@ -742,8 +780,24 @@ static bool blackhole_init_hardware(struct tenstorrent_device *tt_dev)
 	memset(&msg, 0, sizeof(msg));
 	msg.header = ARC_MSG_TYPE_SET_WDT_TIMEOUT;
 	msg.payload[0] = 1000 * blackhole_auto_reset_timeout; // Convert seconds to milliseconds
-	if (arc_msg_send_sync(&bh->tt, &msg) != 0)
-		dev_warn(&tt_dev->pdev->dev, "Failed to set ARC watchdog timeout (this is normal for old FW)\n");
+	ret = arc_msg_send_sync(&bh->tt, &msg);
+	if (ret) {
+		/*
+		 * Older firmware has no watchdog command and returns the generic
+		 * unsupported-command reply. Tolerate that only for the safe default
+		 * (disabled); transport failures and rejected opt-in settings mean
+		 * hardware initialization is incomplete.
+		 */
+		if (blackhole_auto_reset_timeout == 0 && ret == -EREMOTEIO &&
+		    msg.header == ARC_MSG_STATUS_ERROR_REPLY) {
+			dev_warn(&pdev->dev,
+				 "ARC watchdog disable unsupported by firmware\n");
+		} else {
+			dev_err(&pdev->dev, "Failed to configure ARC watchdog: %d (status 0x%x)\n",
+				ret, msg.header);
+			return false;
+		}
+	}
 
 	// Best-effort: start firmware log forwarding. Also re-runs on resume.
 	fw_log_setup(&tt_dev->fw_log);
