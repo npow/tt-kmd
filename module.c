@@ -48,7 +48,13 @@ MODULE_PARM_DESC(reset_limit, "Maximum number of times to reset device during bo
 
 unsigned char auto_reset_timeout = 10;
 module_param(auto_reset_timeout, byte, 0444);
-MODULE_PARM_DESC(auto_reset_timeout, "Timeout duration in seconds for M3 auto reset to occur.");
+MODULE_PARM_DESC(auto_reset_timeout,
+		 "Wormhole M3 auto-reset timeout in seconds (default=10).");
+
+unsigned char blackhole_auto_reset_timeout;
+module_param(blackhole_auto_reset_timeout, byte, 0444);
+MODULE_PARM_DESC(blackhole_auto_reset_timeout,
+		 "Blackhole watchdog (seconds, default 0/off); resets and recovers a stalled ASIC.");
 
 bool power_policy = true;
 module_param(power_policy, bool, 0444);
@@ -57,6 +63,11 @@ MODULE_PARM_DESC(power_policy, "Enable power policy: low power at probe, re-aggr
 bool fw_logging = true;
 module_param(fw_logging, bool, 0444);
 MODULE_PARM_DESC(fw_logging, "Forward Blackhole firmware log messages to the kernel log (default=on).");
+
+bool recovery_bar_access;
+module_param(recovery_bar_access, bool, 0600);
+MODULE_PARM_DESC(recovery_bar_access,
+		 "Allow CAP_SYS_RAWIO processes to map PCI BARs while hardware init is incomplete (default=off).");
 
 uint fw_log_level = FW_LOG_LEVEL_WARN;
 module_param(fw_log_level, uint, 0644);

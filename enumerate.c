@@ -12,6 +12,7 @@
 #include <linux/seq_file.h>
 #include <linux/debugfs.h>
 #include <linux/proc_fs.h>
+#include <linux/delay.h>
 
 #include "enumerate.h"
 #include "interrupt.h"
@@ -22,6 +23,7 @@
 #include "chardev_private.h"
 #include "wormhole.h"
 #include "tlb.h"
+#include "pcie.h"
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0) || TT_RHEL_RELEASE_GE(9, 4)
 #define pci_enable_pcie_error_reporting(dev) do { } while (0)
@@ -31,6 +33,9 @@
 #endif
 
 static DEFINE_XARRAY_ALLOC(tenstorrent_dev_xa);
+
+#define BLACKHOLE_WATCHDOG_MONITOR_MS 500
+#define BLACKHOLE_WATCHDOG_RESET_SETTLE_MS 2000
 
 // Galaxy systems have 32 Tenstorrent chips across 4 boards with 8 chips each.
 // The high nibble of the PCI bus number identifies the board; the low nibble
@@ -255,6 +260,142 @@ static int tenstorrent_reboot_notifier(struct notifier_block *nb,
 	return NOTIFY_DONE;
 }
 
+static void tenstorrent_watchdog_monitor_rearm(struct tenstorrent_device *tt_dev)
+{
+	if (READ_ONCE(tt_dev->watchdog_monitor_enabled))
+		schedule_delayed_work(&tt_dev->watchdog_monitor_work,
+				      msecs_to_jiffies(BLACKHOLE_WATCHDOG_MONITOR_MS));
+}
+
+static void tenstorrent_watchdog_monitor_work_func(struct work_struct *work)
+{
+	struct tenstorrent_device *tt_dev = container_of(to_delayed_work(work),
+							 struct tenstorrent_device,
+							 watchdog_monitor_work);
+	struct pci_dev *pdev = tt_dev->pdev;
+	bool interrupts_enabled = false;
+	bool ok;
+	u16 command;
+	int ret;
+
+	if (!READ_ONCE(tt_dev->watchdog_monitor_enabled))
+		return;
+
+	/*
+	 * Config-space reads remain safe when the endpoint BAR/NOC is hung.  A
+	 * watchdog reset clears Memory Space and Bus Master Enable, while an
+	 * ordinary running Blackhole has both bits set.  Do not wait behind a
+	 * user reset or PCI error recovery; their completion paths own recovery.
+	 */
+	if (!down_write_trylock(&tt_dev->reset_rwsem))
+		goto rearm;
+
+	if (tt_dev->detached || !tt_dev->pci_enabled) {
+		WRITE_ONCE(tt_dev->watchdog_monitor_enabled, false);
+		goto unlock;
+	}
+
+	if (tt_dev->needs_hw_init || tt_dev->pci_error_recovery_active ||
+	    pci_channel_offline(pdev))
+		goto unlock_rearm;
+
+	ret = pci_read_config_word(pdev, PCI_COMMAND, &command);
+	if (ret != PCIBIOS_SUCCESSFUL || command == U16_MAX)
+		goto unlock_rearm;
+
+	if ((command & (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER)) ==
+	    (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER))
+		goto unlock_rearm;
+
+	/*
+	 * The endpoint reset happened outside the reset ioctl, so every existing
+	 * fd, mmap, TLB, iATU and dma-buf refers to destroyed hardware state.
+	 * Fence them before restoring PCI_COMMAND or touching a BAR.
+	 */
+	dev_warn(&pdev->dev,
+		 "Autonomous reset detected (PCI_COMMAND %#x); recovering device\n",
+		 command);
+	tt_dev->needs_hw_init = true;
+	cancel_delayed_work(&tt_dev->power_down_work);
+	tenstorrent_disable_interrupts(tt_dev);
+	if (tt_dev->dev_class->quiesce_device_work)
+		tt_dev->dev_class->quiesce_device_work(tt_dev);
+	tenstorrent_invalidate_open_fds_for_reset(tt_dev);
+
+	/* Let DMC finish resetting and booting ARC before any BAR/NOC access. */
+	msleep(BLACKHOLE_WATCHDOG_RESET_SETTLE_MS);
+
+	if (pci_channel_offline(pdev) || tt_dev->pci_error_recovery_active)
+		goto recovery_failed;
+
+	if (!safe_pci_restore_state(pdev))
+		goto recovery_failed;
+
+	pci_set_master(pdev);
+	tt_dev->dev_class->restore_reset_state(tt_dev);
+
+	interrupts_enabled = tenstorrent_enable_interrupts(tt_dev);
+	if (!interrupts_enabled)
+		dev_warn(&pdev->dev,
+			 "Unable to re-enable interrupts after autonomous reset\n");
+
+	ok = tt_dev->dev_class->init_hardware(tt_dev);
+	if (!ok)
+		goto recovery_failed;
+
+	if (tt_dev->dev_class->probe_telemetry)
+		tt_dev->dev_class->probe_telemetry(tt_dev);
+
+	pci_save_state(pdev);
+	tt_dev->needs_hw_init = false;
+
+	if (power_policy) {
+		ret = tenstorrent_set_aggregated_power_state(tt_dev);
+		if (ret)
+			dev_warn(&pdev->dev,
+				 "Failed to restore aggregated power state: %d\n", ret);
+	}
+
+	kobject_uevent(&tt_dev->dev.kobj, KOBJ_CHANGE);
+	dev_info(&pdev->dev, "Autonomous reset recovery complete\n");
+	goto unlock_rearm;
+
+recovery_failed:
+	if (interrupts_enabled)
+		tenstorrent_disable_interrupts(tt_dev);
+	if (!pci_channel_offline(pdev))
+		pci_clear_master(pdev);
+	WRITE_ONCE(tt_dev->watchdog_monitor_enabled, false);
+	dev_err(&pdev->dev,
+		"Autonomous reset recovery failed; device remains fenced\n");
+	goto unlock;
+
+unlock_rearm:
+	up_write(&tt_dev->reset_rwsem);
+rearm:
+	tenstorrent_watchdog_monitor_rearm(tt_dev);
+	return;
+
+unlock:
+	up_write(&tt_dev->reset_rwsem);
+}
+
+static void tenstorrent_watchdog_monitor_start(struct tenstorrent_device *tt_dev)
+{
+	if (tt_dev->pdev->device != PCI_DEVICE_ID_BLACKHOLE ||
+	    blackhole_auto_reset_timeout == 0 || tt_dev->needs_hw_init)
+		return;
+
+	WRITE_ONCE(tt_dev->watchdog_monitor_enabled, true);
+	tenstorrent_watchdog_monitor_rearm(tt_dev);
+}
+
+static void tenstorrent_watchdog_monitor_stop(struct tenstorrent_device *tt_dev)
+{
+	WRITE_ONCE(tt_dev->watchdog_monitor_enabled, false);
+	cancel_delayed_work_sync(&tt_dev->watchdog_monitor_work);
+}
+
 static int tenstorrent_pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
 {
 	struct tenstorrent_device *tt_dev = NULL;
@@ -305,6 +446,9 @@ static int tenstorrent_pci_probe(struct pci_dev *dev, const struct pci_device_id
 
 	tt_dev->detached = false;
 	tt_dev->needs_hw_init = true;
+	tt_dev->pci_enabled = true;
+	tt_dev->pci_error_recovery_active = false;
+	tt_dev->pci_error_recovery_failed = false;
 	tt_dev->dev_class = device_class;
 	tt_dev->pdev = pci_dev_get(dev);
 	tt_dev->ordinal = ordinal;
@@ -322,6 +466,8 @@ static int tenstorrent_pci_probe(struct pci_dev *dev, const struct pci_device_id
 	INIT_LIST_HEAD(&tt_dev->arc_msg_queue);
 	INIT_LIST_HEAD(&tt_dev->dmabuf_exports);
 	INIT_DELAYED_WORK(&tt_dev->power_down_work, tenstorrent_power_down_work_func);
+	INIT_DELAYED_WORK(&tt_dev->watchdog_monitor_work,
+			  tenstorrent_watchdog_monitor_work_func);
 
 	// The coherent DMA mask (ALLOCATE_DMA_BUF) comes from the device class.
 	// Wormhole is 32 because legacy software assumes it will get 32-bit
@@ -382,7 +528,8 @@ static int tenstorrent_pci_probe(struct pci_dev *dev, const struct pci_device_id
 	tt_dev->needs_hw_init = !device_class->init_hardware(tt_dev);
 
 	pci_save_state(dev);
-	device_class->save_reset_state(tt_dev);
+	if (!tt_dev->needs_hw_init)
+		device_class->save_reset_state(tt_dev);
 
 	tenstorrent_register_device(tt_dev);
 
@@ -397,8 +544,10 @@ static int tenstorrent_pci_probe(struct pci_dev *dev, const struct pci_device_id
 	debugfs_create_file("mappings", 0444, tt_dev->debugfs_root, tt_dev, &mappings_fops);
 
 	// Set initial low-power state via aggregation logic.
-	if (power_policy)
+	if (power_policy && !tt_dev->needs_hw_init)
 		tenstorrent_set_aggregated_power_state(tt_dev);
+
+	tenstorrent_watchdog_monitor_start(tt_dev);
 
 	return 0;
 
@@ -406,12 +555,13 @@ fail_init_device:
 	tenstorrent_disable_interrupts(tt_dev);
 	pci_disable_pcie_error_reporting(dev);
 	pci_set_drvdata(dev, NULL);
+	pci_disable_device(dev);
+	tt_dev->pci_enabled = false;
 	pci_dev_put(dev);
 	xa_erase(&tenstorrent_dev_xa, ordinal);
 	// Direct kfree: this path runs before tenstorrent_register_device,
 	// so tt_dev->dev is not yet initialized and cannot be put_device'd.
 	kfree(tt_dev);
-	pci_disable_device(dev);
 	return err;
 }
 
@@ -420,9 +570,6 @@ static void tenstorrent_pci_remove(struct pci_dev *dev)
 	struct tenstorrent_device *tt_dev = pci_get_drvdata(dev);
 	struct chardev_private *priv;
 	u16 vendor_id;
-
-	// Tear down telemetry first.
-	tt_telemetry_cleanup(tt_dev);
 
 	// Fence deferred-powerdown arming before draining.  tt_cdev_release
 	// arms power_down_work under chardev_mutex only when it observes
@@ -436,13 +583,18 @@ static void tenstorrent_pci_remove(struct pci_dev *dev)
 	tt_dev->detached = true;
 	mutex_unlock(&tt_dev->chardev_mutex);
 
+	tenstorrent_watchdog_monitor_stop(tt_dev);
 	cancel_delayed_work_sync(&tt_dev->power_down_work);
+
+	// No monitor can repopulate the telemetry cache after this teardown.
+	tt_telemetry_cleanup(tt_dev);
 
 	// In a hotplug scenario, the device may not be accessible anymore. Check
 	// if it is still accessible by reading the vendor ID. If it is not, skip
 	// cleanup_hardware (which requires device access).
 	pci_read_config_word(dev, PCI_VENDOR_ID, &vendor_id);
-	if (vendor_id != U16_MAX)
+	if (vendor_id != U16_MAX && tt_dev->pci_enabled &&
+	    !tt_dev->pci_error_recovery_active)
 		tt_dev->dev_class->cleanup_hardware(tt_dev);
 
 	// Disable interrupts before cleanup_device(). A device-class interrupt
@@ -485,7 +637,10 @@ static void tenstorrent_pci_remove(struct pci_dev *dev)
 	tenstorrent_unregister_device(tt_dev);
 
 	pci_disable_pcie_error_reporting(dev);
-	pci_disable_device(dev);
+	if (tt_dev->pci_enabled) {
+		pci_disable_device(dev);
+		tt_dev->pci_enabled = false;
+	}
 
 	pci_set_drvdata(dev, NULL);
 
@@ -515,6 +670,7 @@ static int tenstorrent_suspend(struct device *dev) {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct tenstorrent_device *tt_dev = pci_get_drvdata(pdev);
 
+	tenstorrent_watchdog_monitor_stop(tt_dev);
 	cancel_delayed_work_sync(&tt_dev->power_down_work);
 	tenstorrent_revoke_tlb_dmabufs(tt_dev);
 
@@ -530,23 +686,215 @@ static int tenstorrent_suspend(struct device *dev) {
 static int tenstorrent_resume(struct device *dev) {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct tenstorrent_device *tt_dev = pci_get_drvdata(pdev);
+	bool interrupts_enabled;
 	bool ok;
+
+	down_write(&tt_dev->reset_rwsem);
+	tt_dev->needs_hw_init = true;
 
 	// Re-establish the handler before init_hardware() re-enables firmware
 	// features that signal completion through MSI (such as FW log batches).
-	if (!tenstorrent_enable_interrupts(tt_dev))
+	interrupts_enabled = tenstorrent_enable_interrupts(tt_dev);
+	if (!interrupts_enabled)
 		dev_warn(dev, "Unable to re-enable interrupts after resume\n");
 
 	ok = tt_dev->dev_class->init_hardware(tt_dev);
+	tt_dev->needs_hw_init = !ok;
 
 	// Suspend invalidates the saved state.
 	if (ok)
 		pci_save_state(pdev);
+	else if (interrupts_enabled)
+		tenstorrent_disable_interrupts(tt_dev);
+
+	up_write(&tt_dev->reset_rwsem);
+
+	if (ok)
+		tenstorrent_watchdog_monitor_start(tt_dev);
 
 	return ok ? 0 : -EIO;
 }
 
 static SIMPLE_DEV_PM_OPS(tenstorrent_pm_ops, tenstorrent_suspend, tenstorrent_resume);
+
+static pci_ers_result_t tenstorrent_pci_error_detected(struct pci_dev *pdev,
+						       pci_channel_state_t state)
+{
+	struct tenstorrent_device *tt_dev = pci_get_drvdata(pdev);
+
+	if (!tt_dev)
+		return PCI_ERS_RESULT_DISCONNECT;
+
+	dev_warn(&pdev->dev, "PCIe channel error detected (state %d); quiescing device\n",
+		 state);
+
+	// Fence all device access first. The delayed power work does not take
+	// reset_rwsem, but open/release cannot arm it while this write hold is
+	// active, so cancelling under the hold closes that race.
+	down_write(&tt_dev->reset_rwsem);
+	if (tt_dev->pci_error_recovery_active) {
+		/*
+		 * Returning DISCONNECT ends this driver's recovery participation. Mark
+		 * that terminal state so a later config-space reset is not left waiting
+		 * forever for another error callback that may never arrive.
+		 */
+		tt_dev->pci_error_recovery_failed = true;
+		up_write(&tt_dev->reset_rwsem);
+		return PCI_ERS_RESULT_DISCONNECT;
+	}
+	tt_dev->pci_error_recovery_active = true;
+	tt_dev->pci_error_recovery_failed =
+		state == pci_channel_io_perm_failure ||
+		(state == pci_channel_io_frozen &&
+		 pdev->device == PCI_DEVICE_ID_BLACKHOLE);
+	tt_dev->needs_hw_init = true;
+	cancel_delayed_work_sync(&tt_dev->power_down_work);
+
+	// The endpoint may already be inaccessible. Only stop host-side activity;
+	// cleanup_hardware() is intentionally not called because it performs MMIO
+	// and firmware messaging.
+	tenstorrent_disable_interrupts(tt_dev);
+	if (tt_dev->dev_class->quiesce_device_work)
+		tt_dev->dev_class->quiesce_device_work(tt_dev);
+
+	tenstorrent_invalidate_open_fds_for_reset(tt_dev);
+
+	// Balance the pci_enable_device_mem() in slot_reset() and stop the device
+	// from initiating new transactions until the PCI core resets the link.
+	if (tt_dev->pci_enabled) {
+		pci_clear_master(pdev);
+		pci_disable_device(pdev);
+		tt_dev->pci_enabled = false;
+	}
+	up_write(&tt_dev->reset_rwsem);
+
+	if (state == pci_channel_io_perm_failure)
+		return PCI_ERS_RESULT_DISCONNECT;
+
+	/*
+	 * A frozen Blackhole endpoint may have lost its internal NOC while its
+	 * PCIe link is still recoverable. The PCI core resets a frozen link even
+	 * when the driver returns DISCONNECT, but does not call slot_reset().
+	 * Avoid probing BAR/NOC state there: that probe can itself cause another
+	 * Completion Timeout and DPC event. Leave the endpoint fenced for an
+	 * explicit config-space ASIC reset or remove/reprobe.
+	 */
+	if (state == pci_channel_io_frozen &&
+	    pdev->device == PCI_DEVICE_ID_BLACKHOLE)
+		return PCI_ERS_RESULT_DISCONNECT;
+
+	return PCI_ERS_RESULT_NEED_RESET;
+}
+
+static pci_ers_result_t tenstorrent_pci_slot_reset(struct pci_dev *pdev)
+{
+	struct tenstorrent_device *tt_dev = pci_get_drvdata(pdev);
+	bool interrupts_enabled = false;
+	bool ok = false;
+	int ret;
+
+	if (!tt_dev)
+		return PCI_ERS_RESULT_DISCONNECT;
+
+	if (!tt_dev->pci_enabled) {
+		ret = pci_enable_device_mem(pdev);
+		if (ret) {
+			dev_err(&pdev->dev, "Failed to re-enable PCI device after reset: %d\n",
+				 ret);
+			down_write(&tt_dev->reset_rwsem);
+			tt_dev->pci_error_recovery_failed = true;
+			up_write(&tt_dev->reset_rwsem);
+			return PCI_ERS_RESULT_DISCONNECT;
+		}
+		tt_dev->pci_enabled = true;
+	}
+
+	down_write(&tt_dev->reset_rwsem);
+
+	if (!safe_pci_restore_state(pdev)) {
+		dev_err(&pdev->dev, "Failed to restore PCI configuration after reset\n");
+		goto out;
+	}
+	pci_set_master(pdev);
+
+	tt_dev->dev_class->restore_reset_state(tt_dev);
+
+	// Establish the interrupt handler before init_hardware() enables firmware
+	// features that can signal through MSI.
+	interrupts_enabled = tenstorrent_enable_interrupts(tt_dev);
+	if (!interrupts_enabled)
+		dev_warn(&pdev->dev, "Unable to re-enable interrupts after PCIe recovery\n");
+
+	if (!tt_dev->dev_class->init_hardware(tt_dev)) {
+		dev_err(&pdev->dev, "Hardware reinitialization failed after PCIe reset\n");
+		goto out;
+	}
+
+	if (tt_dev->dev_class->probe_telemetry) {
+		ret = tt_dev->dev_class->probe_telemetry(tt_dev);
+		if (ret)
+			dev_warn(&pdev->dev, "Telemetry reprobe failed after PCIe reset: %d\n",
+				 ret);
+	}
+
+	pci_save_state(pdev);
+	tt_dev->needs_hw_init = false;
+	ok = true;
+
+out:
+	if (!ok) {
+		if (interrupts_enabled)
+			tenstorrent_disable_interrupts(tt_dev);
+		if (tt_dev->pci_enabled) {
+			pci_clear_master(pdev);
+			pci_disable_device(pdev);
+			tt_dev->pci_enabled = false;
+		}
+		tt_dev->pci_error_recovery_failed = true;
+		up_write(&tt_dev->reset_rwsem);
+		return PCI_ERS_RESULT_DISCONNECT;
+	}
+
+	up_write(&tt_dev->reset_rwsem);
+	return PCI_ERS_RESULT_RECOVERED;
+}
+
+static void tenstorrent_pci_error_resume(struct pci_dev *pdev)
+{
+	struct tenstorrent_device *tt_dev = pci_get_drvdata(pdev);
+	int ret;
+
+	if (!tt_dev)
+		return;
+
+	down_write(&tt_dev->reset_rwsem);
+	if (tt_dev->needs_hw_init) {
+		up_write(&tt_dev->reset_rwsem);
+		return;
+	}
+	tt_dev->pci_error_recovery_active = false;
+	tt_dev->pci_error_recovery_failed = false;
+	up_write(&tt_dev->reset_rwsem);
+
+	// All pre-reset fds are stale, so this normally returns the device to its
+	// no-client power state. A userspace policy daemon can reapply board-level
+	// limits in response to the standard KOBJ_CHANGE event below.
+	if (power_policy) {
+		ret = tenstorrent_set_aggregated_power_state(tt_dev);
+		if (ret)
+			dev_warn(&pdev->dev, "Failed to restore aggregated power state: %d\n",
+				 ret);
+	}
+
+	kobject_uevent(&tt_dev->dev.kobj, KOBJ_CHANGE);
+	dev_info(&pdev->dev, "PCIe error recovery complete\n");
+}
+
+static const struct pci_error_handlers tenstorrent_pci_error_handlers = {
+	.error_detected = tenstorrent_pci_error_detected,
+	.slot_reset = tenstorrent_pci_slot_reset,
+	.resume = tenstorrent_pci_error_resume,
+};
 
 extern const struct pci_device_id tenstorrent_ids[];
 static struct pci_driver tenstorrent_pci_driver = {
@@ -555,6 +903,7 @@ static struct pci_driver tenstorrent_pci_driver = {
 	.probe = tenstorrent_pci_probe,
 	.remove = tenstorrent_pci_remove,
 	.shutdown = tenstorrent_pci_remove,
+	.err_handler = &tenstorrent_pci_error_handlers,
 
 	.driver.pm = &tenstorrent_pm_ops,
 };

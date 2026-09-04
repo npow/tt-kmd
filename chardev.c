@@ -10,6 +10,7 @@
 #include <linux/fs.h>
 #include <linux/module.h>
 #include <linux/cdev.h>
+#include <linux/capability.h>
 #include <linux/slab.h>
 #include <linux/pci.h>
 #include <linux/uaccess.h>
@@ -21,6 +22,7 @@
 #include "device.h"
 #include "enumerate.h"
 #include "ioctl.h"
+#include "ioctl_policy.h"
 #include "pcie.h"
 #include "memory.h"
 #include "module.h"
@@ -256,6 +258,28 @@ static void tenstorrent_reset_reclaim_tlbs(struct tenstorrent_device *tt_dev)
 	mutex_unlock(&tt_dev->chardev_mutex);
 }
 
+// Invalidate all userspace state after a reset that was initiated outside an
+// ioctl, such as PCIe AER recovery. Unlike bump_reset_gen(), there is no
+// resetting fd to preserve: every fd that could have observed the pre-reset
+// device must reopen before it can access hardware again.
+//
+// Caller holds reset_rwsem exclusive, which prevents open/release/ioctl/mmap
+// from racing the generation change or the resource reclamation below.
+void tenstorrent_invalidate_open_fds_for_reset(struct tenstorrent_device *tt_dev)
+{
+	atomic_long_inc(&tt_dev->reset_gen);
+	arc_msg_reset_scrub(tt_dev);
+
+	tenstorrent_vma_zap(tt_dev);
+	tenstorrent_reset_reclaim_tlbs(tt_dev);
+	tenstorrent_reset_reclaim_iatus(tt_dev);
+	tenstorrent_revoke_tlb_dmabufs(tt_dev);
+
+	// LOCK_CTL waiters drop reset_rwsem while sleeping. Wake them so they
+	// observe the generation mismatch and return -ENODEV.
+	wake_up_interruptible(&tt_dev->resource_lock_waitqueue);
+}
+
 static long ioctl_reset_device(struct chardev_private *priv,
 			       struct tenstorrent_reset_device __user *arg)
 {
@@ -271,6 +295,27 @@ static long ioctl_reset_device(struct chardev_private *priv,
 
 	if (copy_from_user(&in, &arg->in, sizeof(in)) != 0)
 		return -EFAULT;
+
+	if (!tenstorrent_reset_ioctl_flag_valid(in.flags))
+		return -EINVAL;
+
+	/* Every reset phase can invalidate shared device state. */
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	/*
+	 * A permanently fenced Blackhole can only be reset through PCI config
+	 * space. In particular, ASIC_DMC_RESET sends an ARC message over BAR/NOC
+	 * and can cause another Completion Timeout. Do not attempt to unfence the
+	 * existing device here; recovery must be completed by remove/reprobe.
+	 */
+	if (tt_dev->pci_error_recovery_active) {
+		if (!tt_dev->pci_error_recovery_failed)
+			return -EAGAIN;
+		if (pdev->device != PCI_DEVICE_ID_BLACKHOLE ||
+		    in.flags != TENSTORRENT_RESET_DEVICE_ASIC_RESET)
+			return -EOPNOTSUPP;
+	}
 
 	// Refuse a destructive in-place reset while any TLB window is exported as
 	// a dma-buf: an importer may be doing peer-to-peer DMA into it, and a
@@ -303,6 +348,7 @@ static long ioctl_reset_device(struct chardev_private *priv,
 		} else {
 			ok = false;
 		}
+		priv->device->needs_hw_init = !ok;
 	} else if (in.flags == TENSTORRENT_RESET_DEVICE_RESET_PCIE_LINK) {
 		tenstorrent_vma_zap(tt_dev);
 		ok = pcie_hot_reset_and_restore_state(pdev);
@@ -339,7 +385,6 @@ static long ioctl_reset_device(struct chardev_private *priv,
 		// In the hotplug case, needs_hw_init is false and there is nothing to
 		// do here. Otherwise this was an in-place reset, so re-initialize now.
 		if (priv->device->needs_hw_init) {
-			priv->device->needs_hw_init = false;
 			if (ok && safe_pci_restore_state(pdev)) {
 				priv->device->dev_class->restore_reset_state(priv->device);
 				ok = priv->device->dev_class->init_hardware(priv->device);
@@ -351,6 +396,7 @@ static long ioctl_reset_device(struct chardev_private *priv,
 			} else {
 				ok = false;
 			}
+			priv->device->needs_hw_init = !ok;
 		}
 	} else {
 		return -EINVAL;
@@ -502,6 +548,10 @@ static long ioctl_set_noc_cleanup(struct chardev_private *priv,
 	struct tenstorrent_device *tt_dev = priv->device;
 	struct tenstorrent_set_noc_cleanup data = {0};
 
+	/* This installs an arbitrary device write which runs during close(). */
+	if (!capable(CAP_SYS_RAWIO))
+		return -EPERM;
+
 	// First, ensure the underlying device class supports this operation.
 	if (!tt_dev->dev_class->noc_write32)
 		return -EOPNOTSUPP;
@@ -579,6 +629,9 @@ static long ioctl_noc_read(struct chardev_private *priv, struct tenstorrent_noc_
 	u64 value = 0;
 	long ret;
 
+	if (!capable(CAP_SYS_RAWIO))
+		return -EPERM;
+
 	if (!tt_dev->dev_class->noc_read)
 		return -EOPNOTSUPP;
 
@@ -607,6 +660,9 @@ static long ioctl_noc_write(struct chardev_private *priv, struct tenstorrent_noc
 	struct tenstorrent_device *tt_dev = priv->device;
 	struct tenstorrent_noc_write data = {0};
 	long ret;
+
+	if (!capable(CAP_SYS_RAWIO))
+		return -EPERM;
 
 	if (!tt_dev->dev_class->noc_write)
 		return -EOPNOTSUPP;
@@ -693,18 +749,28 @@ int tenstorrent_set_aggregated_power_state(struct tenstorrent_device *tt_dev)
 }
 
 // Delayed work: send the aggregated idle power-down message after the
-// grace period elapses with no open fds.  Safe to run unguarded:
-// tt_cdev_release only arms this under chardev_mutex when !detached,
-// and tenstorrent_pci_remove writes detached=true under the same mutex
-// before cancel_delayed_work_sync, so the handler cannot fire after
-// teardown begins.
+// grace period elapses with no open fds.
 void tenstorrent_power_down_work_func(struct work_struct *work)
 {
 	struct tenstorrent_device *tt_dev = container_of(to_delayed_work(work),
 							 struct tenstorrent_device,
 							 power_down_work);
 
-	tenstorrent_set_aggregated_power_state(tt_dev);
+	/*
+	 * Avoid waiting behind reset_rwsem while AER holds it and drains this
+	 * work. A queued idle transition is optional; recovery or reset will
+	 * establish the device's next power state explicitly.
+	 */
+	if (!down_read_trylock(&tt_dev->reset_rwsem)) {
+		return;
+	}
+
+	if (!tt_dev->detached && !tt_dev->needs_hw_init &&
+	    tt_dev->pci_enabled && !tt_dev->pci_error_recovery_active) {
+		tenstorrent_set_aggregated_power_state(tt_dev);
+	}
+
+	up_read(&tt_dev->reset_rwsem);
 }
 
 static long ioctl_set_power_state(struct chardev_private *priv, struct tenstorrent_power_state __user *arg)
@@ -760,6 +826,20 @@ static long ioctl_arc_msg(struct chardev_private *priv, struct tenstorrent_smc_m
 	default:
 		return -EINVAL;
 	}
+
+	/*
+	 * Raw Blackhole ARC messages bypass the typed KMD ioctl validation.
+	 * Ordinary clients are restricted to audited runtime commands. Keep reset,
+	 * raw bus, DMA and debug commands out of this user-controlled path even for
+	 * privileged callers; kernel-internal recovery traffic does not use this
+	 * ioctl. This is only defense in depth: firmware remains the final
+	 * validation layer and must reject invalid or unsafe payloads.
+	 */
+	if (data.flags == TENSTORRENT_SMC_MSG_POST &&
+	    tt_dev->pdev->device == PCI_DEVICE_ID_BLACKHOLE &&
+	    !bh_user_arc_msg_allowed(data.message[0] & 0xff,
+				     data.message[1], data.message[2]))
+		return -EPERM;
 
 	mutex_lock(&tt_dev->arc_msg_mutex);
 
@@ -848,11 +928,37 @@ static long tt_cdev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		goto out;
 	}
 
-	// During reset window, only allow info queries and reset operations.
-	if (priv->device->needs_hw_init) {
+	/*
+	 * AER leaves recovery_active set until resume() completes, or permanently
+	 * when recovery fails or a frozen Blackhole is fenced. Do not let a newly
+	 * opened fd reach BARs or firmware in either window. Cached identity queries
+	 * remain useful for diagnosing a fenced endpoint.
+	 */
+	if (priv->device->pci_error_recovery_active ||
+	    !priv->device->pci_enabled) {
 		bool allowed = (cmd == TENSTORRENT_IOCTL_GET_DEVICE_INFO ||
 				cmd == TENSTORRENT_IOCTL_GET_DRIVER_INFO ||
-				cmd == TENSTORRENT_IOCTL_RESET_DEVICE);
+				(cmd == TENSTORRENT_IOCTL_RESET_DEVICE &&
+				 priv->device->pci_error_recovery_failed));
+
+		if (!allowed) {
+			ret = -ENODEV;
+			goto out;
+		}
+	}
+
+	// During reset window, only allow info queries and reset operations.
+	if (priv->device->needs_hw_init) {
+		bool privileged_recovery =
+			recovery_bar_access && capable(CAP_SYS_RAWIO);
+		bool allowed = (cmd == TENSTORRENT_IOCTL_GET_DEVICE_INFO ||
+				cmd == TENSTORRENT_IOCTL_GET_DRIVER_INFO ||
+				cmd == TENSTORRENT_IOCTL_RESET_DEVICE ||
+				(privileged_recovery &&
+				 (cmd == TENSTORRENT_IOCTL_QUERY_MAPPINGS ||
+				  cmd == TENSTORRENT_IOCTL_ALLOCATE_TLB ||
+				  cmd == TENSTORRENT_IOCTL_FREE_TLB ||
+				  cmd == TENSTORRENT_IOCTL_CONFIGURE_TLB)));
 		if (!allowed) {
 			ret = -ENODEV;
 			goto out;
@@ -972,6 +1078,13 @@ static int tt_cdev_mmap(struct file *file, struct vm_area_struct *vma)
 
 	// File descriptor opened before reset is permanently invalid.
 	if (atomic_long_read(&tt_dev->reset_gen) != priv->open_reset_gen) {
+		ret = -ENODEV;
+		goto out;
+	}
+
+	if ((tt_dev->needs_hw_init &&
+	     !(recovery_bar_access && capable(CAP_SYS_RAWIO))) ||
+	    !tt_dev->pci_enabled || tt_dev->pci_error_recovery_active) {
 		ret = -ENODEV;
 		goto out;
 	}
@@ -1103,7 +1216,8 @@ static int tt_cdev_open(struct inode *inode, struct file *file)
 	    && cancel_delayed_work_sync(&tt_dev->power_down_work))
 		dev_dbg(&tt_dev->pdev->dev, "cancelled pending idle powerdown\n");
 
-	if (!power_aware && !tt_dev->detached && !tt_dev->needs_hw_init) {
+	if (!power_aware && !tt_dev->detached && !tt_dev->needs_hw_init &&
+	    tt_dev->pci_enabled && !tt_dev->pci_error_recovery_active) {
 		ret = tenstorrent_set_aggregated_power_state(tt_dev);
 		if (ret < 0)
 			dev_warn(&tt_dev->pdev->dev, "Failed to set initial power state: %d\n", ret);
@@ -1120,7 +1234,16 @@ static void tt_cdev_release_noc_cleanup(struct chardev_private *priv)
 {
 	struct tenstorrent_device *tt_dev = priv->device;
 
-	if (tt_dev->detached || !priv->noc_cleanup.enabled)
+	/*
+	 * Release holds reset_rwsem shared, so the generation and recovery state
+	 * cannot change between this check and the NOC write. A reset invalidates
+	 * every pre-reset cleanup registration: replaying one against the new
+	 * device generation could corrupt unrelated state after recovery.
+	 */
+	if (!priv->noc_cleanup.enabled || tt_dev->detached ||
+	    tt_dev->needs_hw_init || !tt_dev->pci_enabled ||
+	    tt_dev->pci_error_recovery_active ||
+	    priv->open_reset_gen != atomic_long_read(&tt_dev->reset_gen))
 		return;
 
 	tt_dev->dev_class->noc_write32(tt_dev, priv->noc_cleanup.x, priv->noc_cleanup.y,
@@ -1163,8 +1286,10 @@ static void tt_cdev_release_power(struct chardev_private *priv)
 	no_power_contrib = (priv->power_state.validity == TT_POWER_VALIDITY(15, 0) && priv->power_state.power_flags == 0);
 	last_close = list_empty(&tt_dev->open_fds_list);
 
-	if (tt_dev->detached || tt_dev->needs_hw_init)
+	if (tt_dev->detached || tt_dev->needs_hw_init ||
+	    !tt_dev->pci_enabled || tt_dev->pci_error_recovery_active) {
 		return;
+	}
 
 	if (!power_policy)
 		return;

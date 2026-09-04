@@ -144,7 +144,8 @@ int tt_telemetry_read32(struct tenstorrent_device *tt_dev, u16 tag_id, u32 *valu
 		goto out;
 	}
 
-	if (tt_dev->needs_hw_init) {
+	if (tt_dev->needs_hw_init || !tt_dev->pci_enabled ||
+	    tt_dev->pci_error_recovery_active) {
 		r = -ENODATA;
 		goto out;
 	}

@@ -14,5 +14,6 @@ int tenstorrent_register_device(struct tenstorrent_device *gs_dev);
 void tenstorrent_unregister_device(struct tenstorrent_device *gs_dev);
 int tenstorrent_set_aggregated_power_state(struct tenstorrent_device *tt_dev);
 void tenstorrent_power_down_work_func(struct work_struct *work);
+void tenstorrent_invalidate_open_fds_for_reset(struct tenstorrent_device *tt_dev);
 
 #endif

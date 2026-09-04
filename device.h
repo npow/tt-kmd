@@ -39,6 +39,9 @@ struct tenstorrent_device {
 	const struct tenstorrent_device_class *dev_class;
 	bool detached; // No longer valid for hardware access
 	bool needs_hw_init;
+	bool pci_enabled; // Tracks the pci_enable_device()/disable balance
+	bool pci_error_recovery_active; // Protected by reset_rwsem
+	bool pci_error_recovery_failed; // PCI core reported permanent failure
 	atomic_long_t reset_gen; // Generation counter, incremented on reset
 	struct rw_semaphore reset_rwsem;
 	struct dentry *debugfs_root;
@@ -70,6 +73,13 @@ struct tenstorrent_device {
 	// idle_power_down_grace_ms > 0.  Cancelled in suspend and remove so
 	// an in-flight FW message cannot race cleanup_hardware.
 	struct delayed_work power_down_work;
+
+	// Blackhole's DMC watchdog resets the endpoint without necessarily
+	// producing an AER/DPC event.  Monitor PCI config space so the driver can
+	// fence stale mappings and restore the saved device state without probing
+	// a potentially hung BAR.
+	struct delayed_work watchdog_monitor_work;
+	bool watchdog_monitor_enabled;
 
 	DECLARE_BITMAP(tlbs, TENSTORRENT_MAX_INBOUND_TLBS);
 	u32 tlb_counts[MAX_TLB_KINDS];	// Per-device TLB counts (may differ from dev_class defaults)
@@ -114,6 +124,10 @@ struct tenstorrent_device_class {
 	bool (*init_hardware)(struct tenstorrent_device *ttdev);
 	bool (*init_telemetry)(struct tenstorrent_device *ttdev);
 	void (*cleanup_telemetry)(struct tenstorrent_device *ttdev);
+	// Stop driver-side asynchronous work without accessing the device. This
+	// is safe to call while PCIe has isolated the endpoint during AER/DPC
+	// recovery, after interrupts have been disabled.
+	void (*quiesce_device_work)(struct tenstorrent_device *ttdev);
 	void (*cleanup_hardware)(struct tenstorrent_device *ttdev);
 	void (*cleanup_device)(struct tenstorrent_device *ttdev);
 	void (*reboot)(struct tenstorrent_device *ttdev);

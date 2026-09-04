@@ -23,9 +23,8 @@ namespace
 // reports status 0 in word 0.
 constexpr uint32_t SMC_MSG_TYPE_TEST = 0x90;
 
-// 0x02 is not a message type on either WH or BH, so the firmware replies with
-// a nonzero status in word 0.  The driver does not interpret the status, so
-// the POLL still succeeds.
+// 0x02 is not a message type on either WH or BH. Blackhole rejects it at the
+// KMD policy boundary; Wormhole firmware replies with a nonzero status.
 constexpr uint32_t SMC_MSG_TYPE_UNKNOWN = 0x02;
 
 constexpr auto POLL_TIMEOUT = std::chrono::seconds(5);
@@ -263,15 +262,24 @@ void VerifyFirmwareError(const EnumeratedDevice &dev)
     DevFd fd(dev.path);
     uint32_t response[8];
 
-    if (post(fd, SMC_MSG_TYPE_UNKNOWN, 0) != 0)
-        THROW_TEST_FAILURE("POST of unknown message failed");
+    int ret = post(fd, SMC_MSG_TYPE_UNKNOWN, 0);
+    if (dev.type == Blackhole)
+    {
+        if (ret != -EPERM)
+            THROW_TEST_FAILURE("Blackhole should reject unknown user ARC message");
+    }
+    else
+    {
+        if (ret != 0)
+            THROW_TEST_FAILURE("POST of unknown message failed");
 
-    if (poll_wait(fd, response) != 0)
-        THROW_TEST_FAILURE("POLL of unknown message's response should succeed");
-    if (response[0] == 0)
-        THROW_TEST_FAILURE("Failed message should have nonzero status");
+        if (poll_wait(fd, response) != 0)
+            THROW_TEST_FAILURE("POLL of unknown message's response should succeed");
+        if (response[0] == 0)
+            THROW_TEST_FAILURE("Failed message should have nonzero status");
+    }
 
-    // A firmware error completes the message; the fd is idle again.
+    // Either rejection path leaves the fd idle for another message.
     if (post(fd, SMC_MSG_TYPE_TEST, 9) != 0)
         THROW_TEST_FAILURE("POST after firmware error failed");
     if (poll_wait(fd, response) != 0)

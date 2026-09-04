@@ -142,6 +142,8 @@ struct tenstorrent_get_driver_info {
 	struct tenstorrent_get_driver_info_out out;
 };
 
+/* Every RESET_DEVICE operation requires CAP_SYS_ADMIN. */
+
 // legacy tenstorrent_reset_device_in.flags
 #define TENSTORRENT_RESET_DEVICE_RESTORE_STATE 0
 #define TENSTORRENT_RESET_DEVICE_RESET_PCIE_LINK 1
@@ -333,6 +335,9 @@ struct tenstorrent_configure_tlb {
 /**
  * TENSTORRENT_IOCTL_SET_NOC_CLEANUP - Register a cleanup action
  *
+ * Requires CAP_SYS_RAWIO because the action is an arbitrary device write
+ * performed asynchronously when the file descriptor is closed.
+ *
  * Registers an automatic NOC write operation that the driver will perform on
  * the device when the file descriptor is closed. This provides a reliable
  * cleanup mechanism for device-side software in case the host-side userspace
@@ -380,10 +385,12 @@ struct tenstorrent_set_noc_cleanup {
  *   triggered immediately.
  *
  * Behavior at close():
- * - If the power_policy module parameter is enabled (default), the client's
+ * - If the power_policy module parameter is enabled, the client's
  *   contribution is removed and the aggregated state is recomputed. When the
  *   last client closes, the device will return to low power.
  * - If power_policy is disabled, no aggregation is triggered on close.
+ * - Blackhole always retains MRISC PHY, Tensix and L2CPU power because this
+ *   interface has no quiesce handshake. Low power only requests idle AICLK.
  *
  * @argsz: Must be sizeof(struct tenstorrent_power_state).
  * @flags: Reserved for future use, must be 0.
@@ -488,6 +495,10 @@ struct tenstorrent_export_tlb_dmabuf {
  * Returns -EOPNOTSUPP on hardware without a usable message queue (e.g.
  * firmware too old to publish a queue).
  *
+ * Blackhole accepts only an audited subset of runtime commands through this
+ * raw user interface and returns -EPERM for all other POST requests. Typed
+ * ioctls and kernel-internal firmware messages are unaffected.
+ *
  * @argsz: Must be sizeof(struct tenstorrent_smc_msg).
  * @flags: Exactly one of TENSTORRENT_SMC_MSG_POST, _POLL, or _ABANDON.
  * @queue_index: Must be 0 (reserved for future multi-queue support).
@@ -508,6 +519,9 @@ struct tenstorrent_smc_msg {
 /**
  * TENSTORRENT_IOCTL_NOC_READ - Read a small value from a NOC endpoint
  * TENSTORRENT_IOCTL_NOC_WRITE - Write a small value to a NOC endpoint
+ *
+ * Both operations require CAP_SYS_RAWIO because they expose unrestricted
+ * endpoint coordinates and addresses.
  *
  * These perform a single 1, 2, 4, or 8 byte read or write to a NOC address.
  * The transfer is mediated by the kernel using a reserved address window, so

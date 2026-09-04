@@ -8,6 +8,9 @@ PROG := ttkmd_test
 # Host-only unit test binary (no hardware/kernel module required).
 UNIT_PROG := fwlog_test
 
+# Host-only ioctl access policy test.
+POLICY_UNIT_PROG := ioctl_policy_test
+
 # SMC_MSG stress/adversarial test (requires hardware).
 ARC_MSG_PROG := arc_msg_test
 
@@ -37,13 +40,16 @@ $(BUILDDIR)/fwlog_parser.o: ../fwlog_parser.c fwlog_compat.h ../fwlog.h | $(BUIL
 	$(CXX) $(CXXFLAGS) -I.. -include fwlog_compat.h -x c++ -c $< -o $@
 
 .PHONY: all
-all:: $(PROG) $(UNIT_PROG) $(ARC_MSG_PROG)
+all:: $(PROG) $(UNIT_PROG) $(POLICY_UNIT_PROG) $(ARC_MSG_PROG)
 
 $(PROG): $(OBJS)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) $(LIBS) $^ -o $@
 
 $(UNIT_PROG): $(UNIT_OBJS)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) $^ -o $@
+
+$(POLICY_UNIT_PROG): ioctl_policy_test.c ../ioctl_policy.h
+	$(CC) $(CFLAGS) $(LDFLAGS) $< -o $@
 
 $(ARC_MSG_PROG): arc_msg_test.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -pthread $< -o $@
@@ -56,18 +62,20 @@ $(BUILDDIR):
 
 # Build and run the host-only unit tests.
 .PHONY: check
-check: $(UNIT_PROG)
+check: $(UNIT_PROG) $(POLICY_UNIT_PROG)
 	./$(UNIT_PROG)
+	./$(POLICY_UNIT_PROG)
 
 # Build and run everything: host-only unit tests first, then the
 # hardware tests (these need the module loaded and devices present).
 .PHONY: test
 test: all
 	./$(UNIT_PROG)
+	./$(POLICY_UNIT_PROG)
 	./$(PROG)
 	./$(ARC_MSG_PROG)
 
 .PHONY: clean
 clean::
 	-rm -rf $(BUILDDIR)
-	-rm -f $(PROG) $(UNIT_PROG) $(ARC_MSG_PROG)
+	-rm -f $(PROG) $(UNIT_PROG) $(POLICY_UNIT_PROG) $(ARC_MSG_PROG)
