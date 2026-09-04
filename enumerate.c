@@ -734,18 +734,19 @@ static pci_ers_result_t tenstorrent_pci_error_detected(struct pci_dev *pdev,
 	down_write(&tt_dev->reset_rwsem);
 	if (tt_dev->pci_error_recovery_active) {
 		/*
-		 * The PCI core reports permanent failure after it has finished link
-		 * recovery. Record that transition so an explicit config-space reset
-		 * cannot race DPC while it is still handling the frozen link.
+		 * Returning DISCONNECT ends this driver's recovery participation. Mark
+		 * that terminal state so a later config-space reset is not left waiting
+		 * forever for another error callback that may never arrive.
 		 */
-		if (state == pci_channel_io_perm_failure)
-			tt_dev->pci_error_recovery_failed = true;
+		tt_dev->pci_error_recovery_failed = true;
 		up_write(&tt_dev->reset_rwsem);
 		return PCI_ERS_RESULT_DISCONNECT;
 	}
 	tt_dev->pci_error_recovery_active = true;
 	tt_dev->pci_error_recovery_failed =
-		state == pci_channel_io_perm_failure;
+		state == pci_channel_io_perm_failure ||
+		(state == pci_channel_io_frozen &&
+		 pdev->device == PCI_DEVICE_ID_BLACKHOLE);
 	tt_dev->needs_hw_init = true;
 	cancel_delayed_work_sync(&tt_dev->power_down_work);
 
@@ -800,6 +801,9 @@ static pci_ers_result_t tenstorrent_pci_slot_reset(struct pci_dev *pdev)
 		if (ret) {
 			dev_err(&pdev->dev, "Failed to re-enable PCI device after reset: %d\n",
 				 ret);
+			down_write(&tt_dev->reset_rwsem);
+			tt_dev->pci_error_recovery_failed = true;
+			up_write(&tt_dev->reset_rwsem);
 			return PCI_ERS_RESULT_DISCONNECT;
 		}
 		tt_dev->pci_enabled = true;
@@ -838,8 +842,6 @@ static pci_ers_result_t tenstorrent_pci_slot_reset(struct pci_dev *pdev)
 	ok = true;
 
 out:
-	up_write(&tt_dev->reset_rwsem);
-
 	if (!ok) {
 		if (interrupts_enabled)
 			tenstorrent_disable_interrupts(tt_dev);
@@ -848,9 +850,12 @@ out:
 			pci_disable_device(pdev);
 			tt_dev->pci_enabled = false;
 		}
+		tt_dev->pci_error_recovery_failed = true;
+		up_write(&tt_dev->reset_rwsem);
 		return PCI_ERS_RESULT_DISCONNECT;
 	}
 
+	up_write(&tt_dev->reset_rwsem);
 	return PCI_ERS_RESULT_RECOVERED;
 }
 
