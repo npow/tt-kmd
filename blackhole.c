@@ -986,8 +986,14 @@ static int blackhole_set_power_state(struct tenstorrent_device *tt_dev, struct t
 {
 	struct blackhole_device *bh = tt_dev_to_bh_dev(tt_dev);
 	struct arc_msg msg = {0};
+	u16 power_flags = power_state->power_flags;
 
-	msg.header = ARC_MSG_TYPE_POWER_SETTING | (power_state->validity << 8) | (power_state->power_flags << 16);
+	/* Runtime clock-gating L2CPU can make firmware management unreachable. */
+	if ((power_state->validity & 0xf) > 3)
+		power_flags |= TT_POWER_FLAG_L2CPU_ENABLE;
+
+	msg.header = ARC_MSG_TYPE_POWER_SETTING |
+		     (power_state->validity << 8) | (power_flags << 16);
 	BUILD_BUG_ON(sizeof(power_state->power_settings) != sizeof(msg.payload));
 	memcpy(msg.payload, power_state->power_settings, sizeof(msg.payload));
 
