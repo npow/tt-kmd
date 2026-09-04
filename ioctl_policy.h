@@ -4,6 +4,18 @@
 #ifndef TTDRIVER_IOCTL_POLICY_H_INCLUDED
 #define TTDRIVER_IOCTL_POLICY_H_INCLUDED
 
+#include "ioctl.h"
+
+static inline unsigned int bh_runtime_power_flags(unsigned int validity, unsigned int flags)
+{
+	unsigned int valid_flags = (1U << (validity & 0xf)) - 1;
+	unsigned int retained = TT_POWER_FLAG_MRISC_PHY_WAKEUP |
+		TT_POWER_FLAG_TENSIX_ENABLE | TT_POWER_FLAG_L2CPU_ENABLE;
+
+	/* An fd disappearing does not prove that its device work has stopped. */
+	return flags | (retained & valid_flags);
+}
+
 /*
  * Blackhole ARC commands that are safe for ordinary runtime clients. Keep
  * this list intentionally small: raw ARC messages bypass the typed KMD ioctl

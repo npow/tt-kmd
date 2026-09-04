@@ -548,6 +548,10 @@ static long ioctl_set_noc_cleanup(struct chardev_private *priv,
 	struct tenstorrent_device *tt_dev = priv->device;
 	struct tenstorrent_set_noc_cleanup data = {0};
 
+	/* This installs an arbitrary device write which runs during close(). */
+	if (!capable(CAP_SYS_RAWIO))
+		return -EPERM;
+
 	// First, ensure the underlying device class supports this operation.
 	if (!tt_dev->dev_class->noc_write32)
 		return -EOPNOTSUPP;
@@ -625,6 +629,9 @@ static long ioctl_noc_read(struct chardev_private *priv, struct tenstorrent_noc_
 	u64 value = 0;
 	long ret;
 
+	if (!capable(CAP_SYS_RAWIO))
+		return -EPERM;
+
 	if (!tt_dev->dev_class->noc_read)
 		return -EOPNOTSUPP;
 
@@ -653,6 +660,9 @@ static long ioctl_noc_write(struct chardev_private *priv, struct tenstorrent_noc
 	struct tenstorrent_device *tt_dev = priv->device;
 	struct tenstorrent_noc_write data = {0};
 	long ret;
+
+	if (!capable(CAP_SYS_RAWIO))
+		return -EPERM;
 
 	if (!tt_dev->dev_class->noc_write)
 		return -EOPNOTSUPP;

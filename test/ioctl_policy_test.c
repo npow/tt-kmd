@@ -81,11 +81,41 @@ static int test_reset_policy(void)
 	return 0;
 }
 
+static int test_power_lifecycle(void)
+{
+	unsigned int validity;
+	unsigned int flags;
+
+	/* Check every flag combination and validity count, including legacy
+	 * open/last-close aggregation. Only valid dependency bits may change;
+	 * AICLK and unknown future fields must retain their requested values.
+	 */
+	for (validity = 0; validity < 16; validity++) {
+		for (flags = 0; flags <= 0xffff; flags++) {
+			unsigned int actual = bh_runtime_power_flags(validity, flags);
+			unsigned int changed = actual ^ flags;
+			unsigned int valid_mask = (1U << validity) - 1;
+			unsigned int dependencies = 0x0e & valid_mask;
+
+			if ((actual & dependencies) != dependencies ||
+			    (changed & ~dependencies) ||
+			    bh_runtime_power_flags(validity, actual) != actual) {
+				fprintf(stderr,
+					"unsafe power flags: validity=%u request=%x result=%x\n",
+					validity, flags, actual);
+				return 1;
+			}
+		}
+	}
+
+	return 0;
+}
+
 int main(void)
 {
-	if (test_arc_policy() || test_reset_policy())
+	if (test_arc_policy() || test_reset_policy() || test_power_lifecycle())
 		return 1;
 
-	puts("ioctl_policy_test: PASSED (1281/1281)");
+	puts("ioctl_policy_test: PASSED (1281 access checks, 1048576 power transitions)");
 	return 0;
 }
