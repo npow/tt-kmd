@@ -14,9 +14,9 @@
 // Only two firmware message types are ever sent:
 //   * TT_SMC_MSG_TEST (0x90)
 //       Echo.  Response is { 0, test_value + 1, last_serial + 1, ... }.
-//   * TT_SMC_MSG_POWER_SETTING (0x21) with validity = 0
-//       No fields are applied, so the firmware just acks.  Safe to issue
-//       concurrently with the kernel's own power-state aggregation traffic.
+//   * TT_SMC_MSG_GET_AICLK (0x34)
+//       Read-only clock status. Safe to issue concurrently with the kernel's
+//       own power-state aggregation traffic.
 //
 // Anomalies (unexpected errnos, echo mismatches, health-check failures,
 // etc.) are counted and reported at exit; exit status is nonzero if any
@@ -76,8 +76,8 @@ struct tenstorrent_power_state {
 };
 
 // Innocuous firmware messages — see file header.
-#define MSG_TYPE_TEST          0x90
-#define MSG_TYPE_POWER_SETTING 0x21
+#define MSG_TYPE_GET_AICLK 0x34
+#define MSG_TYPE_TEST      0x90
 
 // Deadline for a single round-trip before we give up and abandon.
 #define ROUND_TRIP_TIMEOUT_SEC 2.0
@@ -183,15 +183,10 @@ static void mk_test(uint32_t *m, uint32_t value)
 	m[1] = value;
 }
 
-// Power message with validity = 0 → firmware applies nothing.
-static void mk_power_noop(uint32_t *m)
+static void mk_get_aiclk(uint32_t *m)
 {
-	// Header layout matches struct power_setting_rqst:
-	//   byte 0: command code
-	//   byte 1: bits 0-3 power_flags_valid, bits 4-7 power_settings_valid
-	//   bytes 2-3: power_flags
 	memset(m, 0, 8 * sizeof(uint32_t));
-	m[0] = MSG_TYPE_POWER_SETTING;
+	m[0] = MSG_TYPE_GET_AICLK;
 }
 
 // --- Health check ---
@@ -475,12 +470,12 @@ static void attack_multithread_shared(int fd, int n_threads, int duration_ms)
 // --- Attack: random workers with own fds ---
 //
 // Each worker thread owns its own fd and runs a random mix of TEST and
-// POWER (no-op) ops.  No correctness assertions on the message content here —
+// GET_AICLK ops. No correctness assertions on the message content here —
 // we're stressing the queue state machine and the lock paths.
 struct mt_random_ctx {
 	atomic_int running;
 	atomic_long post_poll_test;
-	atomic_long post_poll_power;
+	atomic_long post_poll_status;
 	atomic_long post_then_poll;
 	atomic_long abandon_calls;
 	atomic_long unexpected_errno;
@@ -504,9 +499,9 @@ static void *mt_random_worker(void *arg)
 			if (ret != 0 && errno != EAGAIN && errno != EBUSY && errno != ETIMEDOUT)
 				atomic_fetch_add(&ctx->unexpected_errno, 1);
 		} else if (pick < 65) {
-			mk_power_noop(m);
+			mk_get_aiclk(m);
 			int ret = round_trip(fd, m, NULL);
-			atomic_fetch_add(&ctx->post_poll_power, 1);
+			atomic_fetch_add(&ctx->post_poll_status, 1);
 			if (ret != 0 && errno != EAGAIN && errno != EBUSY && errno != ETIMEDOUT)
 				atomic_fetch_add(&ctx->unexpected_errno, 1);
 		} else if (pick < 85) {
@@ -552,9 +547,9 @@ static void attack_random_workers(int n_threads, int duration_ms)
 		BUMP_ANOMALY("random workers: %ld unexpected errnos",
 			     atomic_load(&ctx.unexpected_errno));
 
-	printf("  random workers (%d threads, %d ms): pp_test=%ld pp_power=%ld post_poll2=%ld abandon=%ld\n",
+	printf("  random (%d threads, %d ms): test=%ld status=%ld queued=%ld abandon=%ld\n",
 	       n_threads, duration_ms,
-	       atomic_load(&ctx.post_poll_test), atomic_load(&ctx.post_poll_power),
+	       atomic_load(&ctx.post_poll_test), atomic_load(&ctx.post_poll_status),
 	       atomic_load(&ctx.post_then_poll), atomic_load(&ctx.abandon_calls));
 }
 
@@ -684,10 +679,10 @@ static void *user_msg_thread(void *arg)
 
 	while (atomic_load(&ctx->running)) {
 		uint32_t m[8];
-		// Alternate between TEST echo and POWER no-op so the user
-		// path races with the kernel's POWER traffic.
+		// Alternate between TEST and GET_AICLK so the user path races
+		// with the kernel's POWER traffic.
 		if (i & 1)
-			mk_power_noop(m);
+			mk_get_aiclk(m);
 		else
 			mk_test(m, i);
 

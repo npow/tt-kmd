@@ -22,6 +22,7 @@
 #include "device.h"
 #include "enumerate.h"
 #include "ioctl.h"
+#include "ioctl_policy.h"
 #include "pcie.h"
 #include "memory.h"
 #include "module.h"
@@ -294,6 +295,13 @@ static long ioctl_reset_device(struct chardev_private *priv,
 
 	if (copy_from_user(&in, &arg->in, sizeof(in)) != 0)
 		return -EFAULT;
+
+	if (!tenstorrent_reset_ioctl_flag_valid(in.flags))
+		return -EINVAL;
+
+	/* Every reset phase can invalidate shared device state. */
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
 
 	/*
 	 * A permanently fenced Blackhole can only be reset through PCI config
@@ -808,6 +816,20 @@ static long ioctl_arc_msg(struct chardev_private *priv, struct tenstorrent_smc_m
 	default:
 		return -EINVAL;
 	}
+
+	/*
+	 * Raw Blackhole ARC messages bypass the typed KMD ioctl validation.
+	 * Ordinary clients are restricted to audited runtime commands. Keep reset,
+	 * raw bus, DMA and debug commands out of this user-controlled path even for
+	 * privileged callers; kernel-internal recovery traffic does not use this
+	 * ioctl. This is only defense in depth: firmware remains the final
+	 * validation layer and must reject invalid or unsafe payloads.
+	 */
+	if (data.flags == TENSTORRENT_SMC_MSG_POST &&
+	    tt_dev->pdev->device == PCI_DEVICE_ID_BLACKHOLE &&
+	    !bh_user_arc_msg_allowed(data.message[0] & 0xff,
+				     data.message[1], data.message[2]))
+		return -EPERM;
 
 	mutex_lock(&tt_dev->arc_msg_mutex);
 

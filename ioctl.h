@@ -142,6 +142,8 @@ struct tenstorrent_get_driver_info {
 	struct tenstorrent_get_driver_info_out out;
 };
 
+/* Every RESET_DEVICE operation requires CAP_SYS_ADMIN. */
+
 // legacy tenstorrent_reset_device_in.flags
 #define TENSTORRENT_RESET_DEVICE_RESTORE_STATE 0
 #define TENSTORRENT_RESET_DEVICE_RESET_PCIE_LINK 1
@@ -487,6 +489,10 @@ struct tenstorrent_export_tlb_dmabuf {
  *
  * Returns -EOPNOTSUPP on hardware without a usable message queue (e.g.
  * firmware too old to publish a queue).
+ *
+ * Blackhole accepts only an audited subset of runtime commands through this
+ * raw user interface and returns -EPERM for all other POST requests. Typed
+ * ioctls and kernel-internal firmware messages are unaffected.
  *
  * @argsz: Must be sizeof(struct tenstorrent_smc_msg).
  * @flags: Exactly one of TENSTORRENT_SMC_MSG_POST, _POLL, or _ABANDON.
