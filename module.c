@@ -64,6 +64,11 @@ bool fw_logging = true;
 module_param(fw_logging, bool, 0444);
 MODULE_PARM_DESC(fw_logging, "Forward Blackhole firmware log messages to the kernel log (default=on).");
 
+bool recovery_bar_access;
+module_param(recovery_bar_access, bool, 0600);
+MODULE_PARM_DESC(recovery_bar_access,
+		 "Allow CAP_SYS_RAWIO processes to map PCI BARs while hardware init is incomplete (default=off).");
+
 uint fw_log_level = FW_LOG_LEVEL_WARN;
 module_param(fw_log_level, uint, 0644);
 MODULE_PARM_DESC(fw_log_level,

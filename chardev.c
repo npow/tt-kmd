@@ -10,6 +10,7 @@
 #include <linux/fs.h>
 #include <linux/module.h>
 #include <linux/cdev.h>
+#include <linux/capability.h>
 #include <linux/slab.h>
 #include <linux/pci.h>
 #include <linux/uaccess.h>
@@ -916,9 +917,16 @@ static long tt_cdev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
 	// During reset window, only allow info queries and reset operations.
 	if (priv->device->needs_hw_init) {
+		bool privileged_recovery =
+			recovery_bar_access && capable(CAP_SYS_RAWIO);
 		bool allowed = (cmd == TENSTORRENT_IOCTL_GET_DEVICE_INFO ||
 				cmd == TENSTORRENT_IOCTL_GET_DRIVER_INFO ||
-				cmd == TENSTORRENT_IOCTL_RESET_DEVICE);
+				cmd == TENSTORRENT_IOCTL_RESET_DEVICE ||
+				(privileged_recovery &&
+				 (cmd == TENSTORRENT_IOCTL_QUERY_MAPPINGS ||
+				  cmd == TENSTORRENT_IOCTL_ALLOCATE_TLB ||
+				  cmd == TENSTORRENT_IOCTL_FREE_TLB ||
+				  cmd == TENSTORRENT_IOCTL_CONFIGURE_TLB)));
 		if (!allowed) {
 			ret = -ENODEV;
 			goto out;
@@ -1042,8 +1050,9 @@ static int tt_cdev_mmap(struct file *file, struct vm_area_struct *vma)
 		goto out;
 	}
 
-	if (tt_dev->needs_hw_init || !tt_dev->pci_enabled ||
-	    tt_dev->pci_error_recovery_active) {
+	if ((tt_dev->needs_hw_init &&
+	     !(recovery_bar_access && capable(CAP_SYS_RAWIO))) ||
+	    !tt_dev->pci_enabled || tt_dev->pci_error_recovery_active) {
 		ret = -ENODEV;
 		goto out;
 	}

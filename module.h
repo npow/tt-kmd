@@ -29,6 +29,7 @@ extern unsigned char blackhole_auto_reset_timeout;
 extern bool power_policy;
 extern uint idle_power_down_grace_ms;
 extern bool fw_logging;
+extern bool recovery_bar_access;
 extern uint fw_log_level;
 
 extern struct tenstorrent_device_class wormhole_class;
